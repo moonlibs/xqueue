@@ -1,0 +1,1067 @@
+local M = {}
+
+local ffi = require 'ffi'
+local log = require 'log'
+local fiber = require 'fiber'
+local clock = require 'clock'
+
+local tuple_ctype = ffi.typeof(box.tuple.new())
+
+-- compat
+if not table.clear then
+	table.clear = function(t)
+		if type(t) ~= 'table' then
+			error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
+		end
+		local count = #t
+		for i=0, count do t[i]=nil end
+		return
+	end
+end
+-- compat
+
+local function is_array(t)
+	local gen,param,state = ipairs(t)
+	-- print(gen,param,state)
+	local v = gen(param,state)
+	-- print(v)
+	return v ~= nil
+end
+
+local peers = {}
+
+rawset(_G,"\0xq.on_connect",box.session.on_connect(function()
+	local sid = box.session.id()
+	local peer = box.session.peer()
+	box.session.storage.peer = box.session.peer()
+	peers[ sid ] = peer
+	log.info("connected %s, sid=%s, fid=%s", peer, sid, fiber.id() )
+end,rawget(_G,"\0xq.on_connect")))
+
+rawset(_G,"\0xq.on_disconnect",box.session.on_disconnect(function()
+	local sid = box.session.id()
+	local peer = peers[ sid ]
+	peers[ sid ] = nil
+	log.info("disconnected %s, sid=%s, fid=%s", peer, sid, fiber.id() )
+end,rawget(_G,"\0xq.on_disconnect")))
+
+
+--[[
+
+Field sets:
+1. id, status (minimal required configuration)
+2. id, status, priority
+3. id, status, runat
+4. id, status, priority, runat
+
+Primary index variants:
+1. index(status, [ id ])
+2. index(status, priority, [ id ])
+
+
+Format:
+local format = box.space._space.index.name:get(space_name)[ 7 ]
+
+Status:
+	R - ready - task is ready to be taken
+		created by put without delay
+		turned on by release/kick without delay
+		turned on from W when delay passed
+		deleted after ttl if ttl is enabled
+
+	T - taken - task is taken by consumer. may not be taken by other.
+		turned into R after ttr if ttr is enabled
+
+	W - waiting - task is not ready to be taken. waiting for its `delay`
+		requires `runat`
+		`delay` may be set during put, release, kick
+		turned into R after delay
+	
+	B - buried - task was temporary discarded from queue by consumer
+		may be revived using kick by administrator
+		use it in unpredicted conditions, when man intervention is required
+		Without mandatory monitoring (stats.buried) usage of buried is useless and awry
+
+	Z - zombie - task was processed and ack'ed and *temporary* kept for delay
+
+	D - done - task was processed and ack'ed and permanently left in database
+		enabled when keep feature is set
+
+(TODO: reload/upgrade and feature switch)
+
+Interface:
+
+# Creator methods:
+
+	M.upgrade(space, {
+		format = {
+			-- space format. applied to space.format() if passed
+		},
+		fields = {
+			-- id is always taken from pk
+			status   = 'status_field_name'    | status_field_no,
+			runat    = 'runat_field_name'     | runat_field_no,
+			proirity = 'proirity_field_name'  | proirity_field_no,
+		},
+		features = {
+			id = 'auto_increment' | 'uuid' | 'required' | function
+				-- auto_increment - if pk is number, then use it for auto_increment
+				-- uuid - if pk is string, then use uuid for id
+				-- required - primary key MUST be present in tuple during put
+				-- function - funciton will be called to aquire id for task
+
+			buried = true,           -- if true, support bury/kick
+			delayed = true,          -- if true, support delayed tasks, requires `runat`
+
+			keep = true,             -- if true, keep ack'ed tasks in [D]one state, instead of deleting
+				-- mutually exclusive with zombie
+
+			zombie = true|number,    -- requires `runat` field
+				-- if number, then with default zombie delay, otherwise only if set delay during ack
+				-- mutually exclusive with keep
+
+			ttl    = true|number,    -- requires `runat` field
+				-- if number, then with default ttl, otherwise only if set during put/release
+			ttr    = true|number,    -- requires `runat` field
+				-- if number, then with default ttl, otherwise only if set
+		},
+	})
+
+Producer methods:
+	sp:put({...}, [ attr ]) (array or table (if have format) or tuple)
+
+Consumer methods:
+
+* id:
+	- array of keyfields of pk
+	- table of named keyields
+	- tuple
+
+sp:take(timeout) -> tuple
+sp:ack(id, [ attr ])
+	attr.update (only if support zombie)
+sp:release(id, [ attr ])
+	attr.ttr (only if support ttr)
+	attr.ttl (only if support ttl)
+	attr.update
+sp:bury(id, [ attr ])
+	attr.ttl (only if support ttl)
+	attr.update
+
+Admin methods:
+
+sp:queue_stats()
+sp:kick(N | id, [attr]) -- put buried task id or N oldest buried tasks to [R]eady
+
+
+]]
+
+local json = require 'json'
+json.cfg{ encode_invalid_as_nil = true }
+local yaml = require 'yaml'
+local function dd(x)
+	print(yaml.encode(x))
+end
+
+
+local function typeeq(src, ref)
+	if ref == 'str' then
+		return src == 'STR' or src == 'str' or src == 'string'
+	elseif ref == 'num' then
+		return src == 'NUM' or src == 'num' or src == 'number' or src == 'unsigned'
+	else
+		return src == ref
+	end
+end
+
+local function is_eq(a, b, depth)
+	local t = type(a)
+	if t ~= type(b) then return false end
+	if t == 'table' then
+		for k,v in pairs(a) do
+			if b[k] == nil then return end
+			if not is_eq(v,b[k]) then return false end
+		end
+		for k,v in pairs(b) do
+			if a[k] == nil then return end
+			if not is_eq(v,a[k]) then return false end
+		end
+		return true
+	elseif t == 'string' or t == 'number' then
+		return a == b
+	elseif t == 'cdata' then
+		return ffi.typeof(a) == ffi.typeof(b) and a == b
+	else
+		error("Wrong types for equality", depth or 2)
+	end
+end
+
+
+local function _tuple2table ( qformat )
+	local rows = {}
+	for k,v in ipairs(qformat) do
+		table.insert(rows,"\t['"..v.name.."'] = t["..tostring(k).."];\n")
+	end
+	local fun = "return function(t,...) "..
+		"if select('#',...) > 0 then error('excess args',2) end "..
+		"return t and {\n"..table.concat(rows, "").."} or nil end\n"
+	return dostring(fun)
+end
+
+local function _table2tuple ( qformat )
+	local rows = {}
+	for k,v in ipairs(qformat) do
+		table.insert(rows,"\tt['"..v.name.."'] == nil and NULL or t['"..v.name.."'];\n")
+	end
+	local fun = "local NULL = require'msgpack'.NULL return function(t) return "..
+		"t and box.tuple.new({\n"..table.concat(rows, "").."}) or nil end\n"
+	print(fun)
+	return dostring(fun)
+end
+
+local methods = {}
+
+function M.upgrade(space,opts,depth)
+	depth = depth or 0
+	print(string.format("call on xq(%s) + %s", space.name, json.encode(opts)))
+	if not opts.fields then error("opts.fields required",2) end
+	if opts.format then
+		-- todo: check if already have such format
+		local format_av = box.space._space.index.name:get(space.name)[ 7 ]
+		if not is_eq(format_av, opts.format) then
+			space:format(opts.format)
+		else
+			print("formats are equal")
+		end
+	end
+
+	local self = {}
+	if space.xq then
+		self.taken = space.xq.taken
+		self.bysid = space.xq.bysid
+		self._lock = space.xq._lock
+		self.take_wait = space.xq.take_wait
+		self._on_dis = space.xq._on_dis
+	else
+		self.taken = setmetatable({},{__serialize='map'})
+		self.bysid = setmetatable({},{__serialize='map'})
+		-- byfid = {};
+		self._lock = {}
+		self.take_wait = fiber.channel(0)
+	end
+	
+	self.debug = not not opts.debug
+
+	self._on_dis = box.session.on_disconnect(function()
+		local sid = box.session.id()
+		local peer = box.session.storage.peer
+
+		log.info("%s: disconnected %s, sid=%s, fid=%s", space.name, peer, sid, fiber.id() )
+		if self.bysid[sid] then
+			local old = self.bysid[sid]
+			self.bysid[sid] = nil
+			for key in pairs(old) do
+				self.taken[key] = nil
+				local t = space:get(key)
+				if t then
+					if t[ self.fields.status ] == 'T' then
+						self:wakeup(space:update({ key },{
+							{ '=',self.fields.status,'R' },
+							self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
+						}))
+						log.info("Rst: T->R {%s}", key )
+					else
+						log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], key )
+					end
+				else
+					log.error( "Rst: {%s}: taken not found", key )
+				end
+			end
+		end
+	end,self._on_dis)
+
+
+	local format_av = box.space._space.index.name:get(space.name)[ 7 ]
+	local format = {}
+	local have_format = false
+	local have_runat = false
+	for no,f in pairs(format_av) do
+		format[ f.name ] = {
+			name = f.name;
+			type = f.type;
+			no   = no;
+		}
+		format[ no ] = format[ f.name ];
+		have_format = true
+		self.have_format = true
+	end
+	for k,idx in pairs(space.index) do
+		for _,part in pairs(idx.parts) do
+			format[ part.fieldno ] = format[ part.fieldno ] or { no = part.fieldno }
+			format[ part.fieldno ].type = part.type
+		end
+	end
+
+	-- dd(format)
+
+	-- 1. fields check
+	local fields = {}
+	local fieldmap = {}
+	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"}}) do
+		local fname,ftype = f[1], f[2]
+		local num = opts.fields[fname]
+		if num then
+			if type(num) == 'string' then
+				if format[num] then
+					fields[fname] = format[num].no;
+				else
+					error(string.format("unknown field %s for %s", num, fname),2 + depth)
+				end
+			elseif type(num) == 'number' then
+				if format[num] then
+					fields[fname] = num
+				else
+					error(string.format("unknown field %s for %s", num, fname),2 + depth)
+				end
+			else
+				error(string.format("wrong type %s for field %s, number or string required",type(num),fname),2 + depth)
+			end
+			-- check type
+			if format[num] then
+				if not typeeq(format[num].type, ftype) then
+					error(string.format("type mismatch for field %s, required %s, got %s",fname, ftype, format[fname].type),2+depth)
+				end
+			end
+			fieldmap[fname] = format[num].name
+		end
+	end
+
+	dd(fields)
+
+	-- 2. index check
+
+	local pk = space.index[0]
+	if #pk.parts ~= 1 then
+		error("Composite primary keys are not supported yet")
+	end
+	local pktype
+	if typeeq( format[pk.parts[1].fieldno].type, 'str' ) then
+		pktype = 'string'
+	elseif typeeq( format[pk.parts[1].fieldno].type, 'num' ) then
+		pktype = 'number'
+	else
+		error("Unknown key type "..format[pk.parts[1].fieldno].type)
+	end
+	local pkf = {
+		no   = pk.parts[1].fieldno;
+		name = format[pk.parts[1].fieldno].name;
+		['type'] = pktype;
+	}
+	self.key = pkf
+	self.fields = fields
+	self.fieldmap = fieldmap
+
+	function self:getkey(arg)
+		local _type = type(arg)
+		if _type == 'table' then
+			if is_array(arg) then
+				return arg[ self.key.no ]
+			else
+				return arg[ self.key.name ]
+				-- pass
+			end
+		elseif _type == 'cdata' and ffi.typeof(arg) == tuple_ctype then
+			return arg[ self.key.no ]
+		elseif _type == self.key.type then
+			return arg
+		else
+			error("Wrong key/task argument. Expected table or tuple or key", 3)
+		end
+	end
+
+	do
+		for _,index in pairs(space.index) do
+			if type(_) == 'number' then
+				if index.parts[1].fieldno == fields.status
+				and index.parts[2].fieldno == self.key.no then
+					print("found",index.name)
+					self.index = index
+					break
+				end
+			end
+		end
+		if not self.index then
+			error(string.format("not found index by status + id"),2+depth)
+		end
+	end
+
+	local runat_index
+	if fields.runat then
+		for _,index in pairs(space.index) do
+			if type(_) == 'number' then
+				if index.parts[1].fieldno == fields.runat then
+					print("found",index.name)
+					runat_index = index
+					break
+				end
+			end
+		end
+		if not runat_index then
+			error(string.format("fields.runat requires tree index with this first field in it"),2+depth)
+		else
+			have_runat = true
+		end
+	end
+	self.have_runat = have_runat
+
+
+
+	-- 3. features check
+
+	local features = {}
+
+	local gen_id
+	opts.features = opts.features or {}
+	if not opts.features.id then
+		opts.features.id = 'uuid'
+	end
+	-- 'auto_increment' | 'time64' | 'uuid' | 'required' | function
+	if opts.features.id == 'auto_increment' then
+		if not (#pk.parts == 1 and typeeq( pk.parts[1].type, 'num')) then
+			error("For auto_increment numeric pk is mandatory",2+depth)
+		end
+		local pk_fno = pk.parts[1].fieldno
+		gen_id = function()
+			local max = pk:max()
+			if max then
+				return max[pk_fno] + 1
+			else
+				return 1
+			end
+		end
+	elseif opts.features.id == 'time64' then
+		if not (#pk.parts == 1 and typeeq( pk.parts[1].type, 'num')) then
+			error("For time64 numeric pk is mandatory",2+depth)
+		end
+		local clock = require 'clock'
+		gen_id = function()
+			local key = clock.monotonic64()
+			while true do
+				local exists = pk:get(key)
+				if not exists then
+					return key
+				end
+				key = key + 1
+			end
+		end
+	elseif opts.features.id == 'uuid' then
+		if not (#pk.parts == 1 and typeeq( pk.parts[1].type, 'str')) then
+			error("For uuid string pk is mandatory",2+depth)
+		end
+		local uuid = require'uuid'
+		gen_id = function()
+			while true do
+				local key = uuid.str()
+				local exists = pk:get(key)
+				if not exists then
+					return key
+				end
+			end
+		end
+	elseif opts.features.id == 'required' then
+		-- gen_id = function()
+		-- 	-- ???
+		-- 	error("TODO")
+		-- end
+	elseif type(opts.features.id) == 'function' or (debug.getmetatable(opts.features.id) and debug.getmetatable(opts.features.id).__call) then
+		gen_id = opts.features.id
+	else
+		error(string.format("Wrong type for features.id %s, may be 'auto_increment' | 'time64' | 'uuid' | 'required' | function", opts.features.id ),2+depth)
+	end
+
+	if not opts.features.retval then
+		opts.features.retval = have_format and 'table' or 'tuple'
+	end
+
+	if format then
+		self.tuple = _table2tuple(format)
+		self.table = _tuple2table(format)
+	end
+
+	if opts.features.retval == 'table' then
+		self.retwrap = self.table
+	else
+		self.retwrap = function(t) return t end
+	end
+
+	features.buried = not not opts.features.buried
+	features.keep   = not not opts.features.keep
+	if opts.features.delayed then
+		if not have_runat then
+			error(string.format("Delayed feature requires runat field and index" ),2+depth)
+		end
+		features.delayed = true
+	else
+		features.delayed = false
+	end
+
+	if opts.features.zombie then
+		if features.keep then
+			error(string.format("features keep and zombie are mutually exclusive" ),2+depth)
+		end
+		if not have_runat then
+			error(string.format("feature zombie requires runat field and index" ),2+depth)
+		end
+
+		features.zombie = true
+		if type(opts.features.zombie) == 'number' then
+			features.zombie_delay = opts.features.zombie
+		end
+	else
+		features.zombie = false
+	end
+
+	if opts.features.ttl then
+		if not have_runat then
+			error(string.format("feature ttl requires runat field and index" ),2+depth)
+		end
+
+		features.ttl = true
+		if type(opts.features.ttl) == 'number' then
+			features.ttl_default = opts.features.ttl
+		end
+	else
+		features.ttl = false
+	end
+
+	if opts.features.ttr then
+		if not have_runat then
+			error(string.format("feature ttr requires runat field and index" ),2+depth)
+		end
+
+		features.ttr = true
+		if type(opts.features.ttr) == 'number' then
+			features.ttr_default = opts.features.ttr
+		end
+	else
+		features.ttr = false
+	end
+
+	self.gen_id = gen_id
+	self.features = features
+	self.space = space.id
+
+	function self.timeoffset(delta)
+		-- return clock.monotonic64() + tonumber64(tonumber(delta) * 1e6)
+		return clock.monotonic() + tonumber(delta)
+	end
+	function self.timeready(time)
+		return time < clock.monotonic()
+	end
+	function self.timeremaining(time)
+		return time - clock.monotonic()
+	end
+	-- self.NEVER = -1ULL
+	self.NEVER = 0
+
+	function self:keyfield(t)
+		return t[pkf.no]
+	end
+	function self:keypack(t)
+		return t[pkf.no]
+	end
+
+	if opts.worker then
+		local workers = opts.workers or 1
+		local worker = opts.worker
+		for i = 1,workers do
+			fiber.create(function(space,xq,i)
+				fiber.name(space.name .. '.xq.wrk'..tostring(i))
+				repeat fiber.sleep(0.001) until space.xq
+				if xq.ready then xq.ready:get() end
+				log.info("I am worker %s",i)
+				while space.xq == xq do
+					local task = space:take(1)
+					if task then
+						local r,e = pcall(worker,task)
+						local key = xq:getkey(task)
+						if xq.taken[ key ] then
+							log.error("Worker for {%s} not released task", key)
+							space:release(task)
+						end
+						-- local t = space:get{key}
+						-- if t and t[ xq.key.no ] == 'T'
+						-- local 
+						-- if not r then
+						-- 	space:release(task)
+						-- end
+					end
+					fiber.sleep(1)
+				end
+				log.info("worker %s ended", i)
+			end,space,self,i)
+		end
+	end
+
+	if have_runat then
+		self.runat_chan = fiber.channel(0)
+		self.runat = fiber.create(function(space,xq,runat_index)
+			fiber.name(space.name .. '.xq')
+			repeat fiber.sleep(0.001) until space.xq
+			if xq.ready then xq.ready:get() end
+			local chan = xq.runat_chan
+			log.info("Runat started")
+			local maxrun = 1000
+			local curwait
+			local collect = {}
+			while space.xq == xq do
+				local r,e = pcall(function()
+					-- print("runat loop 2 ",box.time64())
+					local remaining
+					for _,t in runat_index:pairs({0},{iterator = box.index.GT}) do
+
+						-- print("checking ",t)
+						if xq.timeready( t[ xq.fields.runat ] ) then
+							table.insert(collect,t)
+						else
+							remaining = xq.timeremaining(t[ xq.fields.runat ])
+							break
+						end
+						if #collect >= maxrun then remaining = 0 break end
+					end
+					
+					for _,t in ipairs(collect) do
+						-- log.info("Runat: %s, %s", _, t)
+						if t[xq.fields.status] == 'W' then
+							log.info("Runat: W->R %s",xq:keyfield(t))
+							-- TODO: default ttl?
+							local u = space:update({ xq:keyfield(t) },{
+								{ '=',xq.fields.status,'R' },
+								{ '=',xq.fields.runat, xq.NEVER }
+							})
+							xq:wakeup(u)
+						elseif t[xq.fields.status] == 'R' and xq.features.ttl then
+							log.info("Runat: Kill R by ttl %s (%+0.2fs)",xq:keyfield(t), fiber.time() - t[ xq.fields.runat ])
+							space:delete{ xq:keyfield(t) }
+						elseif t[xq.fields.status] == 'Z' and xq.features.zombie then
+							log.info("Runat: Kill Zombie %s",xq:keyfield(t))
+							space:delete{ xq:keyfield(t) }
+						elseif t[xq.fields.status] == 'T' and xq.features.ttr then
+							local key = xq:keypack(t)
+							local sid = xq.taken[ key ]
+							local peer = peers[sid] or sid
+
+							log.info("Runat: autorelease T->R by ttr %s taken by %s",xq:keyfield(t), peer)
+							local u = space:update({ xq:keyfield(t) },{
+								{ '=',xq.fields.status,'R' },
+								{ '=',xq.fields.runat, xq.NEVER }
+							})
+							xq.taken[ key ] = nil
+							if sid then
+								self.bysid[ sid ][ key ] = nil
+							end
+							xq:wakeup(u)
+						else
+							log.error("Runat: unsupported status %s for %s",t[xq.fields.status], tostring(t))
+							space:update({ xq:keyfield(t) },{
+								{ '=',xq.fields.runat, xq.NEVER }
+							})
+						end
+					end
+
+					table.clear(collect)
+
+					if remaining then
+						if remaining >= 0 and remaining < 1 then
+							return remaining
+						end
+					end
+					return 1
+				end)
+				
+				if r then
+					curwait = e
+				else
+					curwait = 1
+					log.error("Runat/ERR: %s",e)
+				end
+				-- log.info("Wait %0.2fs",curwait)
+				if curwait == 0 then fiber.sleep(0) end
+				chan:get(curwait)
+			end
+			log.info("Runat ended")
+		end,space,self,runat_index)
+	end
+
+	local function atomic_tail(self, key, status, ...)
+		self._lock[key] = nil
+		if not status then
+			error((...), 3)
+		end
+		return ...
+	end
+	function self:atomic(key, fun, ...)
+		self._lock[key] = true
+		return atomic_tail(self, key, pcall(fun, ...))
+	end
+
+	function self:check_owner(key)
+		local t = space:get(key)
+		if not t then
+			error(string.format( "Task {%s} was not found", key ),2)
+		end
+		if not self.taken[key] then
+			error(string.format( "Task %s not taken by any", key ),2)
+		end
+		if self.taken[key] ~= box.session.id() then
+			error(string.format( "Task %s taken by %d. Not you (%d)", key, self.taken[key], box.session.id() ),2)
+		end
+		return t
+	end
+
+	function self:putback(key)
+		local sid = self.taken[ key ]
+		if sid then
+			self.taken[ key ] = nil
+			if self.bysid[ sid ] then
+				self.bysid[ sid ][ key ] = nil
+			else
+				log.error( "Task {%s} marked as taken by sid=%s but bysid is null", key, sid)
+			end
+		else
+			log.error( "Task {%s} not marked as taken, untake by sid=%s", key, box.session.id() )
+		end
+		-- TODO: putwait
+	end
+
+
+	function self:wakeup(t)
+		if t[self.fieldmap.status] ~= 'R' then return end
+		if self.take_wait:has_readers() then
+			self.take_wait:put(true,0)
+		end
+	end
+
+	function self:make_ready()
+		while self.ready and self.ready:has_readers() do
+			self.ready:put(true,0)
+			fiber.sleep(0)
+		end
+		self.ready = nil
+	end
+	self.ready = fiber.channel(0)
+
+	local meta = debug.getmetatable(space)
+	for k,v in pairs(methods) do meta[k] = v end
+	rawset(space,'xq',self)
+
+	log.info("Upgraded", box.info.status)
+
+
+	function self:starttest()
+		local xq = self
+		if box.info.status == 'orphan' then
+			fiber.create(function()
+				local x = 0
+				repeat
+					fiber.sleep(x/1e5)
+					x = x + 1
+				until box.info.status ~= 'orphan'
+				self:starttest()
+			end)
+			return
+		end
+		if box.info.ro then
+			log.info("Server is ro, not resetting statuses")
+		else
+			-- FIXME: with stable iterators add yield
+			local space = box.space[self.space]
+			box.begin()
+			for _,t in self.index:pairs({'T'},{ iterator = box.index.EQ }) do
+				local key = t[ xq.key.no ]
+				if not self.taken[key] and not self._lock[key] then
+					local update = {
+						{ '=', self.fields.status, 'R' },
+						self.have_runat and {
+							'=',self.fields.runat,
+							self.ttl_default and self.timeoffset( self.ttl_default ) or self.NEVER
+						} or nil
+					}
+					space:update({key}, update)
+					log.info("Start: T->R (%s)", key)
+				end
+			end
+			box.commit()
+		end
+		self:make_ready()
+	end
+	self:starttest()
+end
+
+
+--[[
+* `space:put`
+	- `task` - table or array or tuple
+		+ `table`
+			* **requires** space format
+			* suitable for id generation
+		+ `array`
+			* ignores space format
+			* for id generation use `NULL` (**not** `nil`)
+		+ `tuple`
+			* ignores space format
+			* **can't** be used with id generation
+	- `attr` - table of attributes
+		+ `delay` - number of seconds
+			* if set, task will become `W` instead of `R` for `delay` seconds
+		+ `ttl` - number of seconds
+			* if set, task will be discarded after ttl seconds unless was taken
+
+```lua
+box.space.myqueue:put{ name="xxx"; data="yyy"; }
+box.space.myqueue:put{ "xxx","yyy" }
+box.space.myqueue:put(box.tuple.new{ 1,"xxx","yyy" })
+
+box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5 })
+box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5; ttl = 100 })
+```
+]]
+
+function methods:put(t, opts)
+	local xq = self.xq
+	opts = opts or {}
+	if type(t) == 'table' then
+		if xq.gen_id then
+			if is_array(t) then
+				error("Task from array creation is not implemented yet", 2)
+			else
+				-- pass
+			end
+		end
+	elseif type(t) == 'cdata' and ffi.typeof(t) == tuple_ctype then
+		if xq.gen_id then
+			error("Can't use id generation with tuple.", 2)
+		end
+		error("Task from tuple creation is not implemented yet", 2)
+	else
+		error("Wrong argument to put. Expected table or tuple", 2)
+	end
+	-- here we have table with keys
+	if xq.gen_id then
+		t[ xq.key.name ] = xq.gen_id()
+	else
+		if not t[ xq.key.name ] then
+			error("Primary key is mandatory",2)
+		end
+	end
+
+	-- delayed or ttl or default ttl
+	if opts.delay then
+		if not xq.features.delayed then
+			error("Feature delayed is not enabled",2)
+		end
+		if opts.ttl then
+			error("Features ttl and delay are mutually exclusive",2)
+		end
+		t[ xq.fieldmap.status ] = 'W'
+		t[ xq.fieldmap.runat ] = xq.timeoffset(opts.delay)
+	elseif opts.ttl then
+		if not xq.features.ttl then
+			error("Feature ttl is not enabled",2)
+		end
+		t[ xq.fieldmap.status ] = 'R'
+		t[ xq.fieldmap.runat ] = xq.timeoffset(opts.ttl)
+	elseif xq.features.ttl_default then
+		t[ xq.fieldmap.status ] = 'R'
+		t[ xq.fieldmap.runat ] = xq.timeoffset(xq.features.ttl_default)
+	else
+		t[ xq.fieldmap.status ] = 'R'
+		t[ xq.fieldmap.runat ] = xq.NEVER
+	end
+
+	local tuple = xq.tuple(t)
+	local key = tuple[ xq.key.no ]
+	print("lock key:",key)
+
+	xq._lock[ key ] = true
+	t = self:insert( tuple )
+	xq._lock[ key ] = nil
+
+	xq:wakeup(t)
+	return xq.retwrap(t)
+end
+
+--[[
+* `space:take(timeout)`
+* `space:take(timeout, opts)`
+* `space:take(opts)`
+	- `timeout` - number of seconds to wait for new task
+		+ choose reasonable time
+		+ beware of **readahead** size (see tarantool docs)
+	- returns task tuple or table (see retval) or nothing on timeout
+	- *TODO*: ttr must be there
+]]
+
+function methods:take(timeout, opts)
+	local xq = self.xq
+
+	if type(timeout) == 'table' then
+		opts = timeout
+		timeout = opts.timeout
+	else
+		opts = opts or {}
+	end
+	assert(timeout > 0, "timeout required")
+
+	local ttr
+	if opts.ttr then
+		if not xq.features.ttr then
+			error("Feature ttr is not enabled",2)
+		end
+		ttr = opts.ttr
+	elseif xq.features.ttr_default then
+		ttr = xq.features.ttr_default
+	end
+
+	local now = fiber.time()
+	local key
+	local found
+	while not found do
+		for _,t in xq.index:pairs({'R'},{ iterator = box.index.EQ }) do
+			key = t[ xq.key.no ]
+			if xq._lock[ key ] then
+				-- continue
+			else
+				-- found key
+				xq._lock[ key ] = true
+				found = t
+				break
+			end
+		end
+		if not found then
+			local left = (now + timeout) - fiber.time()
+			if left <= 0 then return end
+			xq.take_wait:get(left)
+		else
+			break
+		end
+	end
+
+	local r,e = pcall(function()
+		local sid = box.session.id()
+		local peer = box.session.storage.peer
+		
+		-- print("Take ",key," for ",peer," sid=",sid, "; fid=",fiber.id() )
+		if xq.debug then
+			log.info("Take {%s} by %s, sid=%s, fid=%s", key, peer, sid, fiber.id())
+		end
+
+		local update = {
+			{ '=', xq.fields.status, 'T' },
+		}
+		-- TODO: update more fields
+
+		if ttr then
+			table.insert(update,{ '=', xq.fields.runat, xq.timeoffset(ttr)})
+			xq.runat_chan:put(true,0)
+		end
+		local t = self:update({key},update)
+
+		if not xq.bysid[ sid ] then xq.bysid[ sid ] = {} end
+		xq.taken[ key ] = sid
+		xq.bysid[ sid ][ key ] = true
+
+		return t
+	end)
+
+	xq._lock[ key ] = nil
+	if not r then
+		print("Error while take: ",e)
+		error(e)
+	end
+	return xq.retwrap(e)
+end
+
+--[[
+* `space:release(id, [attr])`
+	- `id`:
+		+ `string` | `number` - primary key
+		+ *TODO*: `tuple` - key will be extracted using index
+		+ *TODO*: composite pk
+	- `attr`
+		+ `update` - table for update, like in space:update
+		+ `ttl` - timeout for time to live
+		+ `delay` - number of seconds
+			* if set, task will become `W` instead of `R` for `delay` seconds
+]]
+
+
+function methods:release(key, attr)
+	local xq = self.xq
+	key = xq:getkey(key)
+
+	attr = attr or {}
+
+	local t = xq:check_owner(key)
+	print(require'json'.encode(t))
+	local old = t[ xq.fields.status ]
+	local update = {}
+	if attr.update then
+		for _,v in pairs(attr.update) do table.insert(update,v) end
+	end
+
+	-- delayed or ttl or default ttl
+	if attr.delay then
+		if not xq.features.delayed then
+			error("Feature delayed is not enabled",2)
+		end
+		if attr.ttl then
+			error("Features ttl and delay are mutually exclusive",2)
+		end
+		table.insert(update, { '=', xq.fields.status, 'W' })
+		table.insert(update, { '=', xq.fields.runat, xq.timeoffset(attr.delay) })
+	elseif attr.ttl then
+		if not xq.features.ttl then
+			error("Feature ttl is not enabled",2)
+		end
+		table.insert(update, { '=', xq.fields.status, 'R' })
+		table.insert(update, { '=', xq.fields.runat, xq.timeoffset(attr.ttl) })
+	elseif xq.features.ttl_default then
+		table.insert(update, { '=', xq.fields.status, 'R' })
+		table.insert(update, { '=', xq.fields.runat, xq.timeoffset(xq.features.ttl_default) })
+	else
+		table.insert(update, { '=', xq.fields.status, 'R' })
+		if xq.have_runat then
+			table.insert(update, { '=', xq.fields.runat, xq.NEVER })
+		end
+	end
+
+	xq:atomic(key,function()
+		local t = self:update({key}, update)
+
+		xq:wakeup(t)
+		if xq.have_runat then
+			xq.runat_chan:put(true,0)
+		end
+
+		log.info("Rel: %s->%s {%s} +%s from %s/sid=%s/fid=%s", old, t[xq.fields.status],
+			key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
+	end)
+	
+	xq:putback(key,attr)
+		
+	return t
+end
+
+function methods:ack()
+	-- features.zombie
+	-- features.keep
+end
+
+setmetatable(M,{
+	__call = function(M, space, opts)
+		M.upgrade(space,opts,1)
+	end
+})
+
+return M
