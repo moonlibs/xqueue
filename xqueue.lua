@@ -576,25 +576,26 @@ function M.upgrade(space,opts,depth)
 		local worker = opts.worker
 		for i = 1,workers do
 			fiber.create(function(space,xq,i)
-				fiber.name(space.name .. '.xq.wrk'..tostring(i))
+				local fname = space.name .. '.xq.wrk' .. tostring(i)
+				if package.reload then fname = fname .. '.' .. package.reload.count end
+				fiber.name(string.sub(fname,1,32))
 				repeat fiber.sleep(0.001) until space.xq
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
 				while space.xq == xq do
 					local task = space:take(1)
 					if task then
-						local r,e = pcall(worker,task)
 						local key = xq:getkey(task)
+						local r,e = pcall(worker,task)
+						if not r then
+							log.error("Worker for {%s} has error: %s", key, e)
+						else
+							space:ack(task)
+						end
 						if xq.taken[ key ] then
 							log.error("Worker for {%s} not released task", key)
 							space:release(task)
 						end
-						-- local t = space:get{key}
-						-- if t and t[ xq.key.no ] == 'T'
-						-- local 
-						-- if not r then
-						-- 	space:release(task)
-						-- end
 					end
 					fiber.sleep(1)
 				end
@@ -606,7 +607,9 @@ function M.upgrade(space,opts,depth)
 	if have_runat then
 		self.runat_chan = fiber.channel(0)
 		self.runat = fiber.create(function(space,xq,runat_index)
-			fiber.name(space.name .. '.xq')
+			local fname = space.name .. '.xq'
+			if package.reload then fname = fname .. '.' .. package.reload.count end
+			fiber.name(string.sub(fname,1,32))
 			repeat fiber.sleep(0.001) until space.xq
 			if xq.ready then xq.ready:get() end
 			local chan = xq.runat_chan
@@ -864,24 +867,25 @@ function methods:put(t, opts)
 			error("Features ttl and delay are mutually exclusive",2)
 		end
 		t[ xq.fieldmap.status ] = 'W'
-		t[ xq.fieldmap.runat ] = xq.timeoffset(opts.delay)
+		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.delay)
 	elseif opts.ttl then
 		if not xq.features.ttl then
 			error("Feature ttl is not enabled",2)
 		end
 		t[ xq.fieldmap.status ] = 'R'
-		t[ xq.fieldmap.runat ] = xq.timeoffset(opts.ttl)
+		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.ttl)
 	elseif xq.features.ttl_default then
 		t[ xq.fieldmap.status ] = 'R'
-		t[ xq.fieldmap.runat ] = xq.timeoffset(xq.features.ttl_default)
+		t[ xq.fieldmap.runat ]  = xq.timeoffset(xq.features.ttl_default)
+	elseif xq.have_runat then
+		t[ xq.fieldmap.status ] = 'R'
+		t[ xq.fieldmap.runat ]  = xq.NEVER
 	else
 		t[ xq.fieldmap.status ] = 'R'
-		t[ xq.fieldmap.runat ] = xq.NEVER
 	end
 
 	local tuple = xq.tuple(t)
 	local key = tuple[ xq.key.no ]
-	print("lock key:",key)
 
 	xq._lock[ key ] = true
 	t = self:insert( tuple )
@@ -976,7 +980,6 @@ function methods:take(timeout, opts)
 
 	xq._lock[ key ] = nil
 	if not r then
-		print("Error while take: ",e)
 		error(e)
 	end
 	return xq.retwrap(e)
@@ -1003,7 +1006,6 @@ function methods:release(key, attr)
 	attr = attr or {}
 
 	local t = xq:check_owner(key)
-	print(require'json'.encode(t))
 	local old = t[ xq.fields.status ]
 	local update = {}
 	if attr.update then
@@ -1029,11 +1031,11 @@ function methods:release(key, attr)
 	elseif xq.features.ttl_default then
 		table.insert(update, { '=', xq.fields.status, 'R' })
 		table.insert(update, { '=', xq.fields.runat, xq.timeoffset(xq.features.ttl_default) })
+	elseif xq.have_runat then
+		table.insert(update, { '=', xq.fields.status, 'R' })
+		table.insert(update, { '=', xq.fields.runat, xq.NEVER })
 	else
 		table.insert(update, { '=', xq.fields.status, 'R' })
-		if xq.have_runat then
-			table.insert(update, { '=', xq.fields.runat, xq.NEVER })
-		end
 	end
 
 	xq:atomic(key,function()
@@ -1053,9 +1055,63 @@ function methods:release(key, attr)
 	return t
 end
 
-function methods:ack()
+function methods:ack(key, attr)
 	-- features.zombie
 	-- features.keep
+	local xq = self.xq
+	key = xq:getkey(key)
+
+	attr = attr or {}
+
+	local t = xq:check_owner(key)
+	local old = t[ xq.fields.status ]
+	local delete = false
+	local update = {}
+	if attr.update then
+		for _,v in pairs(attr.update) do table.insert(update,v) end
+	end
+
+	-- delayed or ttl or default ttl
+	if attr.delay then
+		if not xq.features.zombie then
+			error("Feature zombie is not enabled",2)
+		end
+		table.insert(update, { '=', xq.fields.status, 'Z' })
+		table.insert(update, { '=', xq.fields.runat, xq.timeoffset(attr.delay) })
+	elseif xq.features.zombie then
+		table.insert(update, { '=', xq.fields.status, 'Z' })
+		if xq.features.zombie_delay then
+			table.insert(update, { '=', xq.fields.runat, xq.timeoffset(xq.features.zombie_delay) })
+		end
+	elseif xq.features.keep then
+		table.insert(update, { '=', xq.fields.status, 'D' })
+	else
+		-- do remove task
+		delete = true
+	end
+
+	xq:atomic(key,function()
+		local t
+		if #update > 0 then
+			t = self:update({key}, update)
+			xq:wakeup(t)
+			if xq.have_runat then
+				xq.runat_chan:put(true,0)
+			end
+			log.info("Ack: %s->%s {%s} +%s from %s/sid=%s/fid=%s", old, t[xq.fields.status],
+				key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
+		end
+
+		if delete then
+			t = self:delete{key}
+			log.info("Ack: %s->delete {%s} +%s from %s/sid=%s/fid=%s", old,
+				key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
+		end
+	end)
+
+	xq:putback(key) -- in real drop form taken key
+
+	return t
 end
 
 setmetatable(M,{
