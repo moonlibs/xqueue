@@ -590,7 +590,9 @@ function M.upgrade(space,opts,depth)
 						if not r then
 							log.error("Worker for {%s} has error: %s", key, e)
 						else
-							space:ack(task)
+							if xq.taken[ key ] then
+								space:ack(task)
+							end
 						end
 						if xq.taken[ key ] then
 							log.error("Worker for {%s} not released task", key)
