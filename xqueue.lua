@@ -101,7 +101,7 @@ Interface:
 			-- id is always taken from pk
 			status   = 'status_field_name'    | status_field_no,
 			runat    = 'runat_field_name'     | runat_field_no,
-			proirity = 'proirity_field_name'  | proirity_field_no,
+			priority = 'priority_field_name'  | priority_field_no,
 		},
 		features = {
 			id = 'auto_increment' | 'uuid' | 'required' | function
@@ -1114,6 +1114,109 @@ function methods:ack(key, attr)
 	xq:putback(key) -- in real drop form taken key
 
 	return t
+end
+
+function methods:bury(task, attr)
+	local xq   = self.xq
+	local key  = xq:getkey(task)
+	local peer = box.session.storage.peer
+	local sid  = box.session.id()
+	attr       = attr or {}
+
+	if xq.debug then
+		log.info("Bury {%s} by %s, sid=%s, fid=%s", key, peer, sid, fiber.id())
+	end
+
+	local update = {}
+	if attr.update then
+		for _,v in pairs(attr.update) do table.insert(update,v) end
+	end
+	table.insert(update, { '=', xq.fields.status, 'B' })
+
+	self:update({key}, update)
+
+	xq:putback(key, attr)
+end
+
+local function kick_task(self, key, attr)
+	local xq   = self.xq
+	local key  = xq:getkey(key)
+	local peer = box.session.storage.peer
+	local sid  = box.session.id()
+	attr       = attr or {}
+
+	if xq.debug then
+		log.info("Kick {%s} by %s, sid=%s, fid=%s", key, peer, sid, fiber.id())
+	end
+
+	self:update({key}, {{ '=', xq.fields.status, 'R' }})
+	xq:putback(key, attr)
+end
+
+function methods:kick(nr_tasks_or_task, attr)
+	attr = attr or {}
+	if type(nr_tasks_or_task) == 'number' then
+		local task_n = 1
+		for _, t in self.xq.index:pairs({'B'},{ iterator = box.index.EQ }) do
+			if task_n > nr_tasks_or_task then break end
+			kick_task(self, t, attr)
+			if task_n % 500 == 0 then fiber.sleep(0) end
+			task_n = task_n + 1
+		end
+	else
+		kick_task(self, nr_tasks_or_task, attr)
+	end
+end
+
+function methods:kill(key, attr)
+	local xq     = self.xq
+	local key    = xq:getkey(key)
+	local task   = self:get(key)
+	local status = task[xq.fields.status]
+	local peer   = box.session.storage.peer
+	local sid    = box.session.id()
+	attr         = attr or {}
+
+	if xq.debug then
+		log.info("Kill {%s} by %s, sid=%s, fid=%s", key, peer, sid, fiber.id())
+	end
+
+	self:delete(key)
+
+	if status == 'T' then
+		for sid in pairs(xq.bysid) do
+			xq.bysid[sid][key] = nil
+		end
+		xq.taken[key] = nil
+		xq._lock[key] = nil
+	end
+end
+
+local status_pretty = {
+	R = "ready",
+	T = "taken",
+	W = "waiting",
+	B = "burried",
+	Z = "zombie",
+	D = "done",
+}
+
+function methods:stats()
+	local xq = self.xq
+
+	local stats = {}
+	local task_n = 1
+	for _, t in xq.index:pairs(nil, { iterator = box.index.ALL }) do
+		local s = t[xq.fields.status]
+		stats[s] = stats[s] and stats[s] + 1 or 1
+		if task_n % 500 == 0 then fiber.sleep(0) end
+		task_n = task_n + 1
+	end
+	local pretty_stats = {}
+	for s, ps in pairs(status_pretty) do
+		pretty_stats[ps] = stats[s] or 0
+	end
+	return pretty_stats
 end
 
 setmetatable(M,{
