@@ -2,7 +2,7 @@ package = 'xqueue'
 version = 'scm-1'
 source  = {
     url    = 'git://github.com/moonlibs/xqueue.git',
-    branch = 'master',
+    branch = 'broken',
 }
 description = {
     summary  = "Package for loading external lua config",
