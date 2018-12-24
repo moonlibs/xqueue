@@ -7,18 +7,16 @@ local clock = require 'clock'
 
 local tuple_ctype = ffi.typeof(box.tuple.new())
 
--- compat
-if not table.clear then
-	table.clear = function(t)
-		if type(t) ~= 'table' then
-			error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
-		end
-		local count = #t
-		for i=0, count do t[i]=nil end
-		return
+local monotonic_max_age = 10*365*86400;
+
+local function table_clear(t)
+	if type(t) ~= 'table' then
+		error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
 	end
+	local count = #t
+	for i=0, count do t[i]=nil end
+	return
 end
--- compat
 
 local function is_array(t)
 	local gen,param,state = ipairs(t)
@@ -409,6 +407,12 @@ function M.upgrade(space,opts,depth)
 		if not runat_index then
 			error(string.format("fields.runat requires tree index with this first field in it"),2+depth)
 		else
+			for _,t in runat_index:pairs({0},{iterator = box.index.GT}) do
+				if t[ self.fields.runat ] < monotonic_max_age then
+					log.info("!!! Queue contains monotonic runat values. Consider updating tasks (https://github.com/moonlibs/xqueue/issues/2)")
+				end
+				break
+			end
 			have_runat = true
 		end
 	end
@@ -674,7 +678,7 @@ function M.upgrade(space,opts,depth)
 						end
 					end
 
-					table.clear(collect)
+					table_clear(collect)
 
 					if remaining then
 						if remaining >= 0 and remaining < 1 then
