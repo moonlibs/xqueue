@@ -1,10 +1,8 @@
-"Usage of this version was disabled. See issue https://github.com/moonlibs/xqueue/issues/2"
-
 package = 'xqueue'
-version = 'scm-1'
+version = 'scm-3'
 source  = {
     url    = 'git://github.com/moonlibs/xqueue.git',
-    branch = 'broken',
+    branch = 'master',
 }
 description = {
     summary  = "Package for loading external lua config",

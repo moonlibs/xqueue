@@ -7,18 +7,16 @@ local clock = require 'clock'
 
 local tuple_ctype = ffi.typeof(box.tuple.new())
 
--- compat
-if not table.clear then
-	table.clear = function(t)
-		if type(t) ~= 'table' then
-			error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
-		end
-		local count = #t
-		for i=0, count do t[i]=nil end
-		return
+local monotonic_max_age = 10*365*86400;
+
+local function table_clear(t)
+	if type(t) ~= 'table' then
+		error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
 	end
+	local count = #t
+	for i=0, count do t[i]=nil end
+	return
 end
--- compat
 
 local function is_array(t)
 	local gen,param,state = ipairs(t)
@@ -223,7 +221,7 @@ local methods = {}
 
 function M.upgrade(space,opts,depth)
 	depth = depth or 0
-	print(string.format("call on xq(%s) + %s", space.name, json.encode(opts)))
+	log.info("xqueue upgrade(%s,%s)", space.name, json.encode(opts))
 	if not opts.fields then error("opts.fields required",2) end
 	if opts.format then
 		-- todo: check if already have such format
@@ -409,6 +407,12 @@ function M.upgrade(space,opts,depth)
 		if not runat_index then
 			error(string.format("fields.runat requires tree index with this first field in it"),2+depth)
 		else
+			for _,t in runat_index:pairs({0},{iterator = box.index.GT}) do
+				if t[ self.fields.runat ] < monotonic_max_age then
+					error("!!! Queue contains monotonic runat values. Consider updating tasks (https://github.com/moonlibs/xqueue/issues/2)")
+				end
+				break
+			end
 			have_runat = true
 		end
 	end
@@ -445,7 +449,7 @@ function M.upgrade(space,opts,depth)
 		end
 		local clock = require 'clock'
 		gen_id = function()
-			local key = clock.monotonic64()
+			local key = clock.realtime64()
 			while true do
 				local exists = pk:get(key)
 				if not exists then
@@ -552,14 +556,13 @@ function M.upgrade(space,opts,depth)
 	self.space = space.id
 
 	function self.timeoffset(delta)
-		-- return clock.monotonic64() + tonumber64(tonumber(delta) * 1e6)
-		return clock.monotonic() + tonumber(delta)
+		return clock.realtime() + tonumber(delta)
 	end
 	function self.timeready(time)
-		return time < clock.monotonic()
+		return time < clock.realtime()
 	end
 	function self.timeremaining(time)
-		return time - clock.monotonic()
+		return time - clock.realtime()
 	end
 	-- self.NEVER = -1ULL
 	self.NEVER = 0
@@ -674,7 +677,7 @@ function M.upgrade(space,opts,depth)
 						end
 					end
 
-					table.clear(collect)
+					table_clear(collect)
 
 					if remaining then
 						if remaining >= 0 and remaining < 1 then
