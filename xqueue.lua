@@ -215,7 +215,7 @@ local function _table2tuple ( qformat )
 	end
 	local fun = "local NULL = require'msgpack'.NULL return function(t) return "..
 		"t and box.tuple.new({\n"..table.concat(rows, "").."}) or nil end\n"
-	print(fun)
+	-- print(fun)
 	return dostring(fun)
 end
 
@@ -336,7 +336,7 @@ function M.upgrade(space,opts,depth)
 		end
 	end
 
-	dd(fields)
+	-- dd(fields)
 
 	-- 2. index check
 
@@ -384,7 +384,7 @@ function M.upgrade(space,opts,depth)
 			if type(_) == 'number' then
 				if index.parts[1].fieldno == fields.status
 				and index.parts[2].fieldno == self.key.no then
-					print("found",index.name)
+					-- print("found",index.name)
 					self.index = index
 					break
 				end
@@ -400,7 +400,7 @@ function M.upgrade(space,opts,depth)
 		for _,index in pairs(space.index) do
 			if type(_) == 'number' then
 				if index.parts[1].fieldno == fields.runat then
-					print("found",index.name)
+					-- print("found",index.name)
 					runat_index = index
 					break
 				end
@@ -760,7 +760,7 @@ function M.upgrade(space,opts,depth)
 	for k,v in pairs(methods) do meta[k] = v end
 	rawset(space,'xq',self)
 
-	log.info("Upgraded", box.info.status)
+	log.info("Upgraded %s into xqueue (status=%s)", space.name, box.info.status)
 
 
 	function self:starttest()
