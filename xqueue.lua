@@ -7,18 +7,36 @@ local clock = require 'clock'
 
 local tuple_ctype = ffi.typeof(box.tuple.new())
 
--- compat
-if not table.clear then
-	table.clear = function(t)
-		if type(t) ~= 'table' then
-			error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
-		end
-		local count = #t
-		for i=0, count do t[i]=nil end
-		return
-	end
+--[[
+
+I've failed with usage of monotonic clock on linux within distributed system.
+So, there is a fix version.
+
+I will consider timestamps, earlier than 10 years ago as monotonic timestamps
+to avoid deletion of data with ttl tasks or early fireups of delayed tasks
+(I don't believe in hosts with 10y uptime running tarantool with xqueue)
+
+It is recommeded to upgrage all runat fields with the following snippet:
+
+local clock = require 'clock'
+
+if t.runat < 10*365*86400 then
+	t.runat = t.runat - clock.monotonic() + clock.realtime()
 end
--- compat
+
+]]
+
+local monotonic_max_age = 10*365*86400;
+local monotonic_offset = clock.realtime() - clock.monotonic();
+
+local function table_clear(t)
+	if type(t) ~= 'table' then
+		error("bad argument #1 to 'clear' (table expected, got "..(t ~= nil and type(t) or 'no value')..")",2)
+	end
+	local count = #t
+	for i=0, count do t[i]=nil end
+	return
+end
 
 local function is_array(t)
 	local gen,param,state = ipairs(t)
@@ -223,7 +241,7 @@ local methods = {}
 
 function M.upgrade(space,opts,depth)
 	depth = depth or 0
-	print(string.format("call on xq(%s) + %s", space.name, json.encode(opts)))
+	log.info("xqueue upgrade(%s,%s)", space.name, json.encode(opts))
 	if not opts.fields then error("opts.fields required",2) end
 	if opts.format then
 		-- todo: check if already have such format
@@ -410,6 +428,12 @@ function M.upgrade(space,opts,depth)
 			error(string.format("fields.runat requires tree index with this first field in it"),2+depth)
 		else
 			have_runat = true
+			for _,t in runat_index:pairs({0},{iterator = box.index.GT}) do
+				if t[ self.fields.runat ] < monotonic_max_age then
+					log.info("!!! Queue contains monotonic runat values. Consider updating tasks (https://github.com/moonlibs/xqueue/issues/2)")
+				end
+				break
+			end
 		end
 	end
 	self.have_runat = have_runat
@@ -445,7 +469,7 @@ function M.upgrade(space,opts,depth)
 		end
 		local clock = require 'clock'
 		gen_id = function()
-			local key = clock.monotonic64()
+			local key = clock.realtime64()
 			while true do
 				local exists = pk:get(key)
 				if not exists then
@@ -546,20 +570,22 @@ function M.upgrade(space,opts,depth)
 	else
 		features.ttr = false
 	end
-
+	
 	self.gen_id = gen_id
 	self.features = features
 	self.space = space.id
-
+	
 	function self.timeoffset(delta)
 		-- return clock.monotonic64() + tonumber64(tonumber(delta) * 1e6)
-		return clock.monotonic() + tonumber(delta)
+		-- return clock.monotonic() + tonumber(delta)
+		return clock.realtime() + tonumber(delta)
 	end
 	function self.timeready(time)
-		return time < clock.monotonic()
+		-- return time < clock.monotonic()
+		return time < clock.realtime()
 	end
 	function self.timeremaining(time)
-		return time - clock.monotonic()
+		return time - clock.realtime()
 	end
 	-- self.NEVER = -1ULL
 	self.NEVER = 0
@@ -622,20 +648,48 @@ function M.upgrade(space,opts,depth)
 			while space.xq == xq do
 				local r,e = pcall(function()
 					-- print("runat loop 2 ",box.time64())
-					local remaining
+					local remaining, runat
 					for _,t in runat_index:pairs({0},{iterator = box.index.GT}) do
-
+						
+						runat = t[ xq.fields.runat ]
+						if runat < monotonic_max_age then
+							log.info("Runat: Correct %s t=%s for +%s",xq:keyfield(t),runat,monotonic_offset)
+							runat = runat + monotonic_offset
+						end
 						-- print("checking ",t)
-						if xq.timeready( t[ xq.fields.runat ] ) then
+						if xq.timeready( runat ) then
 							table.insert(collect,t)
 						else
-							remaining = xq.timeremaining(t[ xq.fields.runat ])
+							remaining = xq.timeremaining( runat )
 							break
 						end
 						if #collect >= maxrun then remaining = 0 break end
 					end
+
+					if runat and runat < monotonic_max_age then
+						-- second pass scan for CORRECT realtime runet timestamps, after monotonic timestamps
+						-- it is needed for correct queue work during convertation
+						for _,t in runat_index:pairs({monotonic_max_age},{iterator = box.index.GT}) do
+
+							-- print("checking ",t)
+							if xq.timeready( t[ xq.fields.runat ] ) then
+								table.insert(collect,t)
+							else
+								remaining = xq.timeremaining(t[ xq.fields.runat ])
+								break
+							end
+							if #collect >= maxrun then remaining = 0 break end
+						end
+					end
 					
 					for _,t in ipairs(collect) do
+						local runat = t[ xq.fields.runat ]
+						local monotonic_runat
+						if runat < monotonic_max_age then
+							runat = runat + monotonic_offset
+							monotonic_runat = true
+						end
+						
 						-- log.info("Runat: %s, %s", _, t)
 						if t[xq.fields.status] == 'W' then
 							log.info("Runat: W->R %s",xq:keyfield(t))
@@ -646,8 +700,12 @@ function M.upgrade(space,opts,depth)
 							})
 							xq:wakeup(u)
 						elseif t[xq.fields.status] == 'R' and xq.features.ttl then
-							log.info("Runat: Kill R by ttl %s (%+0.2fs)",xq:keyfield(t), fiber.time() - t[ xq.fields.runat ])
-							space:delete{ xq:keyfield(t) }
+							if not monotonic_runat then
+								log.info("Runat: Kill R by ttl %s (%+0.2fs)",xq:keyfield(t), clock.realtime() - t[ xq.fields.runat ])
+								space:delete{ xq:keyfield(t) }
+							else
+								log.info("Runat: !!! WOULD kill R by ttl %s (%+0.2fs), BUT... will keep it, because runat contains monotonic value",xq:keyfield(t), clock.realtime() - t[ xq.fields.runat ])
+							end
 						elseif t[xq.fields.status] == 'Z' and xq.features.zombie then
 							log.info("Runat: Kill Zombie %s",xq:keyfield(t))
 							space:delete{ xq:keyfield(t) }
@@ -674,7 +732,7 @@ function M.upgrade(space,opts,depth)
 						end
 					end
 
-					table.clear(collect)
+					table_clear(collect)
 
 					if remaining then
 						if remaining >= 0 and remaining < 1 then
@@ -761,7 +819,6 @@ function M.upgrade(space,opts,depth)
 	rawset(space,'xq',self)
 
 	log.info("Upgraded %s into xqueue (status=%s)", space.name, box.info.status)
-
 
 	function self:starttest()
 		local xq = self
