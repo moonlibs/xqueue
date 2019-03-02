@@ -623,6 +623,8 @@ function M.upgrade(space,opts,depth)
 			local curwait
 			local collect = {}
 			while space.xq == xq do
+				table_clear(collect)
+
 				local r,e = pcall(function()
 					-- print("runat loop 2 ",box.time64())
 					local remaining
@@ -676,8 +678,6 @@ function M.upgrade(space,opts,depth)
 							})
 						end
 					end
-
-					table_clear(collect)
 
 					if remaining then
 						if remaining >= 0 and remaining < 1 then
