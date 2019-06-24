@@ -84,6 +84,8 @@ Status:
 
 	D - done - task was processed and ack'ed and permanently left in database
 		enabled when keep feature is set
+	
+	X - reserved for statistics
 
 (TODO: reload/upgrade and feature switch)
 
@@ -236,9 +238,11 @@ function M.upgrade(space,opts,depth)
 	local self = {}
 	if space.xq then
 		self.taken = space.xq.taken
+		self._stat = space.xq._stat
 		self.bysid = space.xq.bysid
 		self._lock = space.xq._lock
 		self.take_wait = space.xq.take_wait
+		self._on_repl  = space.xq._on_repl
 		self._on_dis = space.xq._on_dis
 	else
 		self.taken = setmetatable({},{__serialize='map'})
@@ -249,36 +253,11 @@ function M.upgrade(space,opts,depth)
 	end
 	
 	self.debug = not not opts.debug
-
-	self._on_dis = box.session.on_disconnect(function()
-		local sid = box.session.id()
-		local peer = box.session.storage.peer
-
-		log.info("%s: disconnected %s, sid=%s, fid=%s", space.name, peer, sid, fiber.id() )
-		if self.bysid[sid] then
-			local old = self.bysid[sid]
-			self.bysid[sid] = nil
-			for key in pairs(old) do
-				self.taken[key] = nil
-				local t = space:get(key)
-				if t then
-					if t[ self.fields.status ] == 'T' then
-						self:wakeup(space:update({ key },{
-							{ '=',self.fields.status,'R' },
-							self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
-						}))
-						log.info("Rst: T->R {%s}", key )
-					else
-						log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], key )
-					end
-				else
-					log.error( "Rst: {%s}: taken not found", key )
-				end
-			end
-		end
-	end,self._on_dis)
-
-
+	
+	if not self._default_truncate then
+		self._default_truncate = space.truncate
+	end
+	
 	local format_av = box.space._space.index.name:get(space.name)[ 7 ]
 	local format = {}
 	local have_format = false
@@ -358,7 +337,18 @@ function M.upgrade(space,opts,depth)
 	self.key = pkf
 	self.fields = fields
 	self.fieldmap = fieldmap
-
+	
+	if not self._stat then
+		self._stat = {
+			counts = {};
+			transition = {};
+		}
+		for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
+			local s = t[self.fields.status]
+			self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
+		end
+	end
+	
 	function self:getkey(arg)
 		local _type = type(arg)
 		if _type == 'table' then
@@ -585,7 +575,7 @@ function M.upgrade(space,opts,depth)
 				repeat fiber.sleep(0.001) until space.xq
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
-				while space.xq == xq do
+				while box.space[space.name] and space.xq == xq do
 					local task = space:take(1)
 					if task then
 						local key = xq:getkey(task)
@@ -622,7 +612,7 @@ function M.upgrade(space,opts,depth)
 			local maxrun = 1000
 			local curwait
 			local collect = {}
-			while space.xq == xq do
+			while box.space[space.name] and space.xq == xq do
 				local r,e = pcall(function()
 					-- print("runat loop 2 ",box.time64())
 					local remaining
@@ -758,9 +748,71 @@ function M.upgrade(space,opts,depth)
 		self.ready = nil
 	end
 	self.ready = fiber.channel(0)
-
+	
 	local meta = debug.getmetatable(space)
 	for k,v in pairs(methods) do meta[k] = v end
+	
+	-- Triggers must set right before updating space
+	-- because raising error earlier leads to trigger inconsistency
+	self._on_repl = space:on_replace(function(old, new)
+		local old_st, new_st
+		local counts = self._stat.counts
+		if old then
+			old_st = old[self.fields.status]
+			if counts[old_st] and counts[old_st] > 0 then
+				counts[old_st] = counts[old_st] - 1
+			else
+				log.error(
+					"Have not valid statistic by status: %s with value: %s",
+					old_st, tostring(counts[old_st])
+				)
+			end
+		else
+			old_st = 'X'
+		end
+		
+		if new then
+			new_st = new[self.fields.status]
+			counts[new_st] = (counts[new_st] or 0LL) + 1
+			if counts[new_st] < 0 then
+				log.error("Statistic overflow by task type: %s", new_st)
+			end
+		else
+			new_st = 'X'
+		end
+		
+		local field = old_st.."-"..new_st
+		self._stat.transition[field] = (self._stat.transition[field] or 0ULL) + 1
+	end, self._on_repl)
+	
+	self._on_dis = box.session.on_disconnect(function()
+		local sid = box.session.id()
+		local peer = box.session.storage.peer
+		
+		log.info("%s: disconnected %s, sid=%s, fid=%s", space.name, peer, sid, fiber.id() )
+		if self.bysid[sid] then
+			local old = self.bysid[sid]
+			self.bysid[sid] = nil
+			for key in pairs(old) do
+				self.taken[key] = nil
+				local t = space:get(key)
+				if t then
+					if t[ self.fields.status ] == 'T' then
+						self:wakeup(space:update({ key }, {
+							{ '=',self.fields.status,'R' },
+							self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
+						}))
+						log.info("Rst: T->R {%s}", key )
+					else
+						log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], key )
+					end
+				else
+					log.error( "Rst: {%s}: taken not found", key )
+				end
+			end
+		end
+	end, self._on_dis)
+	
 	rawset(space,'xq',self)
 
 	log.info("Upgraded %s into xqueue (status=%s)", space.name, box.info.status)
@@ -1195,31 +1247,45 @@ function methods:kill(key, attr)
 	end
 end
 
-local status_pretty = {
-	R = "ready",
-	T = "taken",
-	W = "waiting",
-	B = "burried",
-	Z = "zombie",
-	D = "done",
+-- special remap of truncate for deliting stats and saving methods
+function methods:truncate()
+	local stat = self.xq._stat
+	for status, _ in pairs(stat.counts) do
+		stat.counts[status] = 0LL
+	end
+	for transition, _ in pairs(stat.transition) do
+		stat.transition[transition] = nil
+	end
+	local ret = self.xq._default_truncate(self)
+	-- Now we reset our methods after truncation because
+	-- as we can see in on_replace_dd_truncate:
+	-- https://github.com/tarantool/tarantool/blob/0b7cc52607b2290d2f35cc68ee1a8243988c2735/src/box/alter.cc#L2239
+	-- tarantool deletes space and restores it with the same indexes
+	-- but without methods
+	setmetatable(self, methods)
+	return ret
+end
+
+local pretty_st = {
+	R = "Ready",
+	T = "Taken",
+	W = "Waiting",
+	B = "Buried",
+	Z = "Zombie",
+	D = "Done",
 }
 
-function methods:stats()
-	local xq = self.xq
-
-	local stats = {}
-	local task_n = 1
-	for _, t in xq.index:pairs(nil, { iterator = box.index.ALL }) do
-		local s = t[xq.fields.status]
-		stats[s] = stats[s] and stats[s] + 1 or 1
-		if task_n % 500 == 0 then fiber.sleep(0) end
-		task_n = task_n + 1
-	end
-	local pretty_stats = {}
-	for s, ps in pairs(status_pretty) do
-		pretty_stats[ps] = stats[s] or 0
-	end
-	return pretty_stats
+function methods:stats(pretty)
+	local stats = table.deepcopy(self.xq._stat)
+		for s, ps in pairs(pretty_st) do
+			if pretty then
+				stats.counts[ps] = stats.counts[s] or 0LL
+				stats.counts[s]  = nil
+			else
+				stats.counts[s] = stats.counts[s] or 0LL
+			end
+		end
+	return stats
 end
 
 setmetatable(M,{
