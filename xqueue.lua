@@ -1257,12 +1257,13 @@ function methods:truncate()
 		stat.transition[transition] = nil
 	end
 	local ret = self.xq._default_truncate(self)
+	local meta = debug.getmetatable(self)
+	for k,v in pairs(methods) do meta[k] = v end
 	-- Now we reset our methods after truncation because
 	-- as we can see in on_replace_dd_truncate:
 	-- https://github.com/tarantool/tarantool/blob/0b7cc52607b2290d2f35cc68ee1a8243988c2735/src/box/alter.cc#L2239
 	-- tarantool deletes space and restores it with the same indexes
 	-- but without methods
-	setmetatable(self, methods)
 	return ret
 end
 
