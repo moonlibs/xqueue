@@ -245,7 +245,15 @@ function M.upgrade(space,opts,depth)
 		self._on_repl  = space.xq._on_repl
 		self._on_dis = space.xq._on_dis
 	else
-		self.taken = setmetatable({},{__serialize='map'})
+		self.taken = setmetatable({},{
+			__serialize='map',
+			__newindex = function(t, key, val)
+				rawset(t, tostring(key), val)
+			end,
+			__index = function(t, key)
+				return rawget(t, tostring(key))
+			end
+		})
 		self.bysid = setmetatable({},{__serialize='map'})
 		-- byfid = {};
 		self._lock = {}
