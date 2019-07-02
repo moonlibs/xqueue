@@ -210,7 +210,7 @@ end
 
 local function _table2tuple ( qformat )
 	local rows = {}
-	for k,v in ipairs(qformat) do
+	for _,v in ipairs(qformat) do
 		table.insert(rows,"\tt['"..v.name.."'] == nil and NULL or t['"..v.name.."'];\n")
 	end
 	local fun = "local NULL = require'msgpack'.NULL return function(t) return "..
@@ -235,6 +235,9 @@ function M.upgrade(space,opts,depth)
 		end
 	end
 
+	-- This variable will be defined later
+	local taken_mt
+
 	local self = {}
 	if space.xq then
 		self.taken = space.xq.taken
@@ -245,21 +248,22 @@ function M.upgrade(space,opts,depth)
 		self._on_repl  = space.xq._on_repl
 		self._on_dis = space.xq._on_dis
 	else
-		self.taken = setmetatable({},{
-			__serialize='map',
-			__newindex = function(t, key, val)
-				rawset(t, tostring(key), val)
-			end,
-			__index = function(t, key)
-				return rawget(t, tostring(key))
-			end
-		})
-		self.bysid = setmetatable({},{__serialize='map'})
+		self.taken = {}
+		self.bysid = {}
 		-- byfid = {};
 		self._lock = {}
 		self.take_wait = fiber.channel(0)
 	end
-	
+	setmetatable(self.bysid, {
+		__serialize='map',
+		__newindex = function(t, key, val)
+			if type(val) == 'table' then
+				return rawset(t, key, setmetatable(val, taken_mt))
+			else
+				return rawset(t, key, val)
+			end
+		end
+	})
 	self.debug = not not opts.debug
 	
 	if not self._default_truncate then
@@ -280,7 +284,7 @@ function M.upgrade(space,opts,depth)
 		have_format = true
 		self.have_format = true
 	end
-	for k,idx in pairs(space.index) do
+	for _,idx in pairs(space.index) do
 		for _,part in pairs(idx.parts) do
 			format[ part.fieldno ] = format[ part.fieldno ] or { no = part.fieldno }
 			format[ part.fieldno ].type = part.type
@@ -332,11 +336,23 @@ function M.upgrade(space,opts,depth)
 	local pktype
 	if typeeq( format[pk.parts[1].fieldno].type, 'str' ) then
 		pktype = 'string'
+		taken_mt = { __serialize = 'map' }
 	elseif typeeq( format[pk.parts[1].fieldno].type, 'num' ) then
 		pktype = 'number'
+		taken_mt = {
+			__serialize = 'map',
+			__newindex = function(t, key, val)
+				return rawset(t, tostring(ffi.cast("uint64_t", key)), val)
+			end,
+			__index = function(t, key)
+				return rawget(t, tostring(ffi.cast("uint64_t", key)))
+			end
+		}
 	else
 		error("Unknown key type "..format[pk.parts[1].fieldno].type)
 	end
+	setmetatable(self.taken, taken_mt)
+
 	local pkf = {
 		no   = pk.parts[1].fieldno;
 		name = format[pk.parts[1].fieldno].name;
@@ -405,11 +421,11 @@ function M.upgrade(space,opts,depth)
 		if not runat_index then
 			error(string.format("fields.runat requires tree index with this first field in it"),2+depth)
 		else
-			for _,t in runat_index:pairs({0},{iterator = box.index.GT}) do
+			local t = runat_index:pairs({0},{iterator = box.index.GT}):nth(1)
+			if t then
 				if t[ self.fields.runat ] < monotonic_max_age then
-					error("!!! Queue contains monotonic runat values. Consider updating tasks (https://github.com/moonlibs/xqueue/issues/2)")
+					error("!!! Queue contains monotonic runat. Consider updating tasks (https://github.com/moonlibs/xqueue/issues/2)")
 				end
-				break
 			end
 			have_runat = true
 		end
@@ -445,7 +461,6 @@ function M.upgrade(space,opts,depth)
 		if not (#pk.parts == 1 and typeeq( pk.parts[1].type, 'num')) then
 			error("For time64 numeric pk is mandatory",2+depth)
 		end
-		local clock = require 'clock'
 		gen_id = function()
 			local key = clock.realtime64()
 			while true do
@@ -475,10 +490,16 @@ function M.upgrade(space,opts,depth)
 		-- 	-- ???
 		-- 	error("TODO")
 		-- end
-	elseif type(opts.features.id) == 'function' or (debug.getmetatable(opts.features.id) and debug.getmetatable(opts.features.id).__call) then
+	elseif type(opts.features.id) == 'function'
+		or (debug.getmetatable(opts.features.id)
+		and debug.getmetatable(opts.features.id).__call)
+	then
 		gen_id = opts.features.id
 	else
-		error(string.format("Wrong type for features.id %s, may be 'auto_increment' | 'time64' | 'uuid' | 'required' | function", opts.features.id ),2+depth)
+		error(string.format(
+			"Wrong type for features.id %s, may be 'auto_increment' | 'time64' | 'uuid' | 'required' | function",
+			opts.features.id
+		), 2+depth)
 	end
 
 	if not opts.features.retval then
@@ -1104,7 +1125,7 @@ function methods:release(key, attr)
 	end
 
 	xq:atomic(key,function()
-		local t = self:update({key}, update)
+		t = self:update({key}, update)
 
 		xq:wakeup(t)
 		if xq.have_runat then
@@ -1116,7 +1137,7 @@ function methods:release(key, attr)
 	end)
 	
 	xq:putback(key,attr)
-		
+	
 	return t
 end
 
@@ -1156,7 +1177,6 @@ function methods:ack(key, attr)
 	end
 
 	xq:atomic(key,function()
-		local t
 		if #update > 0 then
 			t = self:update({key}, update)
 			xq:wakeup(t)
@@ -1231,17 +1251,15 @@ function methods:kick(nr_tasks_or_task, attr)
 	end
 end
 
-function methods:kill(key, attr)
+function methods:kill(key)
 	local xq     = self.xq
 	local key    = xq:getkey(key)
 	local task   = self:get(key)
 	local status = task[xq.fields.status]
 	local peer   = box.session.storage.peer
-	local sid    = box.session.id()
-	attr         = attr or {}
 
 	if xq.debug then
-		log.info("Kill {%s} by %s, sid=%s, fid=%s", key, peer, sid, fiber.id())
+		log.info("Kill {%s} by %s, sid=%s, fid=%s", key, peer, box.session.id(), fiber.id())
 	end
 
 	self:delete(key)
