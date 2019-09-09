@@ -9,7 +9,7 @@ require 'strict'.on()
 
 -- box.once('schema',function()
 	local format = {
-		{name = "id",      type = "unsigned"},
+		{name = "id",      type = "string"},
 		{name = "status",  type = "string"},
 		{name = "runat",   type = "number"},
 		{name = "attempt", type = "number"},
@@ -19,9 +19,9 @@ require 'strict'.on()
 	}
 	box.schema.space.create('tasks', { if_not_exists = true })
 
-	box.space.tasks:create_index('primary', { unique = true, parts = {1, 'unsigned'}, if_not_exists = true})
-	box.space.tasks:create_index('xq', { unique = false, parts = { 2, 'str', 1, 'unsigned' }, if_not_exists = true})
-	box.space.tasks:create_index('run', { unique = true, parts = { 3, 'number', 1, 'unsigned' }, if_not_exists = true})
+	box.space.tasks:create_index('primary', { unique = true, parts = {1, 'string'}, if_not_exists = true})
+	box.space.tasks:create_index('xq', { unique = false, parts = { 2, 'str', 1, 'string' }, if_not_exists = true})
+	box.space.tasks:create_index('run', { unique = true, parts = { 3, 'number', 1, 'string' }, if_not_exists = true})
 -- end)
 
 if not package.path:match('%.%./%?%.lua;') then
@@ -36,7 +36,7 @@ require 'xqueue' ( box.space.tasks, {
 		runat  = 'runat';
 	};
 	features = {
-		id = 'time64',
+		id = 'uuid',
 		delayed = true,
 	};
 	workers = 1;
@@ -45,6 +45,9 @@ require 'xqueue' ( box.space.tasks, {
 	end;
 } )
 
+for i = 1, 100 do
+	box.space.tasks:put{ attempt = 0, action = "doit", attr = {} }
+end
 
 require'console'.start()
 os.exit()
