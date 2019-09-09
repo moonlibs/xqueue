@@ -602,7 +602,7 @@ function M.upgrade(space,opts,depth)
 							space:release(task)
 						end
 					end
-					fiber.sleep(1)
+					fiber.yield()
 				end
 				log.info("worker %s ended", i)
 			end,space,self,i)
