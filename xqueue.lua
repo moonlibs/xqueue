@@ -392,18 +392,39 @@ function M.upgrade(space,opts,depth)
 	end
 
 	do
-		for _,index in pairs(space.index) do
-			if type(_) == 'number' then
-				if index.parts[1].fieldno == fields.status
-				and index.parts[2].fieldno == self.key.no then
-					-- print("found",index.name)
-					self.index = index
-					break
+		local filter
+		if fields.priority then
+			filter = function(index)
+				if #index.parts >= 3
+					and index.parts[1].fieldno == fields.status
+					and index.parts[2].fieldno == fields.priority
+					and index.parts[3].fieldno == self.key.no
+				then
+					return true
+				end
+			end
+		else
+			filter = function(index)
+				if #index.parts >= 2
+					and index.parts[1].fieldno == fields.status
+					and index.parts[2].fieldno == self.key.no
+				then
+					return true
 				end
 			end
 		end
+		for i,index in pairs(space.index) do
+			if type(i) == 'number' and filter(index) then
+				self.index = index
+				break
+			end
+		end
 		if not self.index then
-			error(string.format("not found index by status + id"),2+depth)
+			if fields.priority then
+				error(string.format("not found index by status + priority + id"),2+depth)
+			else
+				error(string.format("not found index by status + id"),2+depth)
+			end
 		end
 	end
 
