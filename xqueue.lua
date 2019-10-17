@@ -395,22 +395,16 @@ function M.upgrade(space,opts,depth)
 		local filter
 		if fields.priority then
 			filter = function(index)
-				if #index.parts >= 3
+				return #index.parts >= 3
 					and index.parts[1].fieldno == fields.status
 					and index.parts[2].fieldno == fields.priority
 					and index.parts[3].fieldno == self.key.no
-				then
-					return true
-				end
 			end
 		else
 			filter = function(index)
-				if #index.parts >= 2
+				return #index.parts >= 2
 					and index.parts[1].fieldno == fields.status
 					and index.parts[2].fieldno == self.key.no
-				then
-					return true
-				end
 			end
 		end
 		for i,index in pairs(space.index) do
