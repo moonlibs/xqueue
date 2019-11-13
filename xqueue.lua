@@ -834,26 +834,30 @@ function M.upgrade(space,opts,depth)
 		local peer = box.session.storage.peer
 		
 		log.info("%s: disconnected %s, sid=%s, fid=%s", space.name, peer, sid, fiber.id() )
+		box.session.storage.destroyed = true
 		if self.bysid[sid] then
 			local old = self.bysid[sid]
-			self.bysid[sid] = nil
-			for key in pairs(old) do
-				self.taken[key] = nil
-				local t = space:get(key)
-				if t then
-					if t[ self.fields.status ] == 'T' then
-						self:wakeup(space:update({ key }, {
-							{ '=',self.fields.status,'R' },
-							self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
-						}))
-						log.info("Rst: T->R {%s}", key )
+			while next(old) do
+				for key in pairs(old) do
+					self.taken[key] = nil
+					old[key] = nil
+					local t = space:get(key)
+					if t then
+						if t[ self.fields.status ] == 'T' then
+							self:wakeup(space:update({ key }, {
+								{ '=',self.fields.status,'R' },
+								self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
+							}))
+							log.info("Rst: T->R {%s}", key )
+						else
+							log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], key )
+						end
 					else
-						log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], key )
+						log.error( "Rst: {%s}: taken not found", key )
 					end
-				else
-					log.error( "Rst: {%s}: taken not found", key )
 				end
 			end
+			self.bysid[sid] = nil
 		end
 	end, self._on_dis)
 	
@@ -1047,6 +1051,7 @@ function methods:take(timeout, opts)
 			local left = (now + timeout) - fiber.time()
 			if left <= 0 then return end
 			xq.take_wait:get(left)
+			if box.session.storage.destroyed then return end
 		else
 			break
 		end
