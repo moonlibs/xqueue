@@ -838,22 +838,22 @@ function M.upgrade(space,opts,depth)
 		if self.bysid[sid] then
 			local old = self.bysid[sid]
 			while next(old) do
-				for key in pairs(old) do
+				for key,realkey in pairs(old) do
 					self.taken[key] = nil
 					old[key] = nil
-					local t = space:get(key)
+					local t = space:get(realkey)
 					if t then
 						if t[ self.fields.status ] == 'T' then
-							self:wakeup(space:update({ key }, {
+							self:wakeup(space:update({ realkey }, {
 								{ '=',self.fields.status,'R' },
 								self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
 							}))
-							log.info("Rst: T->R {%s}", key )
+							log.info("Rst: T->R {%s}", realkey )
 						else
-							log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], key )
+							log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], realkey )
 						end
 					else
-						log.error( "Rst: {%s}: taken not found", key )
+						log.error( "Rst: {%s}: taken not found", realkey )
 					end
 				end
 			end
@@ -1013,6 +1013,7 @@ end
 
 function methods:take(timeout, opts)
 	local xq = self.xq
+	timeout = timeout or 0
 
 	if type(timeout) == 'table' then
 		opts = timeout
@@ -1020,7 +1021,7 @@ function methods:take(timeout, opts)
 	else
 		opts = opts or {}
 	end
-	assert(timeout > 0, "timeout required")
+	assert(timeout >= 0, "timeout required")
 
 	local ttr
 	if opts.ttr then
@@ -1079,7 +1080,7 @@ function methods:take(timeout, opts)
 
 		if not xq.bysid[ sid ] then xq.bysid[ sid ] = {} end
 		xq.taken[ key ] = sid
-		xq.bysid[ sid ][ key ] = true
+		xq.bysid[ sid ][ key ] = key
 
 		return t
 	end)
