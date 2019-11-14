@@ -711,8 +711,6 @@ function M.upgrade(space,opts,depth)
 						end
 					end
 
-					table_clear(collect)
-
 					if remaining then
 						if remaining >= 0 and remaining < 1 then
 							return remaining
@@ -721,6 +719,8 @@ function M.upgrade(space,opts,depth)
 					return 1
 				end)
 				
+				table_clear(collect)
+
 				if r then
 					curwait = e
 				else
