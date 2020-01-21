@@ -296,7 +296,7 @@ function M.upgrade(space,opts,depth)
 	-- 1. fields check
 	local fields = {}
 	local fieldmap = {}
-	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"}}) do
+	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"},{"tube","str"}}) do
 		local fname,ftype = f[1], f[2]
 		local num = opts.fields[fname]
 		if num then
@@ -415,9 +415,34 @@ function M.upgrade(space,opts,depth)
 		end
 		if not self.index then
 			if fields.priority then
-				error(string.format("not found index by status + priority + id"),2+depth)
+				error("not found index by status + priority + id",2+depth)
 			else
-				error(string.format("not found index by status + id"),2+depth)
+				error("not found index by status + id",2+depth)
+			end
+		end
+
+		if fields.tube then
+			for n,index in pairs(space.index) do
+				if type(n) == 'number' and index.parts[1].fieldno == fields.tube then
+					local not_match = false
+					for i = 2, #index.parts do
+						if index.parts[i].fieldno ~= self.index.parts[i-1].fieldno then
+							not_match = true
+							break
+						end
+					end
+					if not not_match then
+						self.tube_index = index
+						break
+					end
+				end
+			end
+			if not self.tube_index then
+				if fields.priority then
+					error("not found index by tube + status + priority + id",2+depth)
+				else
+					error("not found index by tube + status + id",2+depth)
+				end
 			end
 		end
 	end
@@ -583,6 +608,10 @@ function M.upgrade(space,opts,depth)
 		end
 	else
 		features.ttr = false
+	end
+
+	if fields.tube then
+		features.tube = true
 	end
 
 	self.gen_id = gen_id
@@ -1017,7 +1046,7 @@ function methods:take(timeout, opts)
 
 	if type(timeout) == 'table' then
 		opts = timeout
-		timeout = opts.timeout
+		timeout = opts.timeout or 0
 	else
 		opts = opts or {}
 	end
@@ -1033,11 +1062,25 @@ function methods:take(timeout, opts)
 		ttr = xq.features.ttr_default
 	end
 
+	local index
+	local start_with
+
+	if opts.tube then
+		if not xq.features.tube then
+			error("Feature tube is not enabled", 2)
+		end
+		index = xq.tube_index
+		start_with = {opts.tube, 'R'}
+	else
+		index = xq.index
+		start_with = {'R'}
+	end
+
 	local now = fiber.time()
 	local key
 	local found
 	while not found do
-		for _,t in xq.index:pairs({'R'},{ iterator = box.index.EQ }) do
+		for _,t in index:pairs(start_with, { iterator = box.index.EQ }) do
 			key = t[ xq.key.no ]
 			if xq._lock[ key ] then
 				-- continue
