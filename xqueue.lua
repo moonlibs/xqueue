@@ -245,6 +245,7 @@ function M.upgrade(space,opts,depth)
 		self.bysid = space.xq.bysid
 		self._lock = space.xq._lock
 		self.take_wait = space.xq.take_wait
+		self.take_chans = space.xq.take_chans or {}
 		self._on_repl  = space.xq._on_repl
 		self._on_dis = space.xq._on_dis
 	else
@@ -253,6 +254,7 @@ function M.upgrade(space,opts,depth)
 		-- byfid = {};
 		self._lock = {}
 		self.take_wait = fiber.channel(0)
+		self.take_chans = setmetatable({}, { __mode = 'v' })
 	end
 	setmetatable(self.bysid, {
 		__serialize='map',
@@ -808,6 +810,15 @@ function M.upgrade(space,opts,depth)
 
 	function self:wakeup(t)
 		if t[self.fieldmap.status] ~= 'R' then return end
+		if self.fieldmap.tube then
+			-- we may have consumers in the tubes:
+			local tube_chan = self.take_chans[t[self.fieldmap.tube]]
+			if tube_chan and tube_chan:has_readers() and tube_chan:put(true, 0) then
+				-- we have successfully notified consumer
+				return
+			end
+			-- otherwise fallback to default channel:
+		end
 		if self.take_wait:has_readers() then
 			self.take_wait:put(true,0)
 		end
@@ -953,6 +964,9 @@ end
 			* if set, task will become `W` instead of `R` for `delay` seconds
 		+ `ttl` - number of seconds
 			* if set, task will be discarded after ttl seconds unless was taken
+		+ `wait` - number of seconds
+			* if set, callee fiber will be blocked up to `wait` seconds until task won't
+			be processed or timeout reached.
 
 ```lua
 box.space.myqueue:put{ name="xxx"; data="yyy"; }
@@ -1002,6 +1016,10 @@ function methods:put(t, opts)
 		end
 		t[ xq.fieldmap.status ] = 'W'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.delay)
+
+		if opts.wait then
+			error("Are you crazy? Call of :put({...}, { wait = <>, delay = <> }) looks weird", 2)
+		end
 	elseif opts.ttl then
 		if not xq.features.ttl then
 			error("Feature ttl is not enabled",2)
@@ -1021,11 +1039,23 @@ function methods:put(t, opts)
 	local tuple = xq.tuple(t)
 	local key = tuple[ xq.key.no ]
 
-	xq._lock[ key ] = true
-	t = self:insert( tuple )
-	xq._lock[ key ] = nil
+	local chan
+	if opts.wait then
+		chan = fiber.channel(1)
+		xq.put_wait[key] = chan
+	end
 
+	xq:atomic(key, function()
+		t = self:insert(tuple)
+	end)
 	xq:wakeup(t)
+
+	if chan then
+		local res = chan:get(opts.wait)
+		if res then
+			return xq.retwrap(res), true
+		end
+	end
 	return xq.retwrap(t)
 end
 
@@ -1036,6 +1066,7 @@ end
 	- `timeout` - number of seconds to wait for new task
 		+ choose reasonable time
 		+ beware of **readahead** size (see tarantool docs)
+	- `tube` - name of the tube worker wants to take task from (feature tube must be enabled)
 	- returns task tuple or table (see retval) or nothing on timeout
 	- *TODO*: ttr must be there
 ]]
@@ -1065,12 +1096,18 @@ function methods:take(timeout, opts)
 	local index
 	local start_with
 
+	local tube_chan
 	if opts.tube then
 		if not xq.features.tube then
 			error("Feature tube is not enabled", 2)
 		end
+
+		assert(type(opts.tube) == 'string', "opts.tube must be a string")
+
 		index = xq.tube_index
 		start_with = {opts.tube, 'R'}
+		tube_chan = xq.take_chans[opts.tube] or fiber.channel()
+		xq.take_chans[opts.tube] = tube_chan
 	else
 		index = xq.index
 		start_with = {'R'}
@@ -1082,9 +1119,7 @@ function methods:take(timeout, opts)
 	while not found do
 		for _,t in index:pairs(start_with, { iterator = box.index.EQ }) do
 			key = t[ xq.key.no ]
-			if xq._lock[ key ] then
-				-- continue
-			else
+			if not xq._lock[ key ] then
 				-- found key
 				xq._lock[ key ] = true
 				found = t
@@ -1093,13 +1128,22 @@ function methods:take(timeout, opts)
 		end
 		if not found then
 			local left = (now + timeout) - fiber.time()
-			if left <= 0 then return end
-			xq.take_wait:get(left)
-			if box.session.storage.destroyed then return end
-		else
-			break
+			if left <= 0 then goto finish end
+
+			(tube_chan or xq.take_wait):get(left)
+			if box.session.storage.destroyed then goto finish end
 		end
 	end
+	::finish::
+
+	-- If we were last reader from the tube
+	-- we remove channel. Writers will get false
+	-- on :put if they exists.
+	if tube_chan and not tube_chan:has_readers() then
+		tube_chan:close()
+		xq.take_chans[opts.tube] = nil
+	end
+	if not found then return end
 
 	local r,e = pcall(function()
 		local sid = box.session.id()
