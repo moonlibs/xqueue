@@ -245,7 +245,8 @@ function M.upgrade(space,opts,depth)
 		self.bysid = space.xq.bysid
 		self._lock = space.xq._lock
 		self.take_wait = space.xq.take_wait
-		self.take_chans = space.xq.take_chans or {}
+		self.take_chans = space.xq.take_chans or setmetatable({}, { __mode = 'v' })
+		self.put_wait = space.xq.put_wait or setmetatable({}, { __mode = 'v' })
 		self._on_repl  = space.xq._on_repl
 		self._on_dis = space.xq._on_dis
 	else
@@ -253,6 +254,7 @@ function M.upgrade(space,opts,depth)
 		self.bysid = {}
 		-- byfid = {};
 		self._lock = {}
+		self.put_wait = setmetatable({}, { __mode = 'v' })
 		self.take_wait = fiber.channel(0)
 		self.take_chans = setmetatable({}, { __mode = 'v' })
 	end
@@ -390,6 +392,14 @@ function M.upgrade(space,opts,depth)
 			return arg
 		else
 			error("Wrong key/task argument. Expected table or tuple or key", 3)
+		end
+	end
+
+	function self:packkey(key)
+		if type(key) == 'cdata' then
+			return tostring(ffi.cast("uint64_t", key))
+		else
+			return key
 		end
 	end
 
@@ -639,6 +649,43 @@ function M.upgrade(space,opts,depth)
 		return t[pkf.no]
 	end
 
+	-- Notify producer if it is still waiting us.
+	-- Producer waits only for successfully processed task
+	-- or for task which would never be processed.
+	-- Discarding to process task depends on consumer's logic.
+	-- Also task can be deleted from space by exceeding TTL.
+	-- Producer should not be notified if queue is able to process task in future.
+	local function notify_producer(key, task)
+		local pkey = self:packkey(key)
+		local chan = self.put_wait[pkey]
+		if not chan or not chan:has_readers() then
+			-- no producer
+			return
+		end
+		if task.status == 'Z' or task.status == 'D' then
+			-- task was processed
+			chan:put({ task, true }, 0)
+			return
+		end
+		if not space:get{key} then
+			-- task is not present in space
+			-- it could be TTL or :ack
+			if task.status == 'T' then
+				-- task was acked:
+				chan:put({ task, true }, 0)
+			elseif task.status == 'R' then
+				-- task was killed by TTL
+				chan:put({ task, false }, 0)
+			end
+		else
+			-- task is still in space
+			if task.status == 'B' then
+				-- task was buried
+				chan:put({ task, false }, 0)
+			end
+		end
+	end
+
 	if opts.worker then
 		local workers = opts.workers or 1
 		local worker = opts.worker
@@ -714,8 +761,10 @@ function M.upgrade(space,opts,depth)
 							})
 							xq:wakeup(u)
 						elseif t[xq.fields.status] == 'R' and xq.features.ttl then
-							log.info("Runat: Kill R by ttl %s (%+0.2fs)",xq:keyfield(t), fiber.time() - t[ xq.fields.runat ])
-							space:delete{ xq:keyfield(t) }
+							local key = xq:keyfield(t)
+							log.info("Runat: Kill R by ttl %s (%+0.2fs)", key, fiber.time() - t[ xq.fields.runat ])
+							t = space:delete{key}
+							notify_producer(key, t)
 						elseif t[xq.fields.status] == 'Z' and xq.features.zombie then
 							log.info("Runat: Kill Zombie %s",xq:keyfield(t))
 							space:delete{ xq:keyfield(t) }
@@ -792,7 +841,8 @@ function M.upgrade(space,opts,depth)
 		return t
 	end
 
-	function self:putback(key)
+	function self:putback(task)
+		local key = task[ self.key.no ]
 		local sid = self.taken[ key ]
 		if sid then
 			self.taken[ key ] = nil
@@ -804,9 +854,9 @@ function M.upgrade(space,opts,depth)
 		else
 			log.error( "Task {%s} not marked as taken, untake by sid=%s", key, box.session.id() )
 		end
-		-- TODO: putwait
-	end
 
+		notify_producer(key, task)
+	end
 
 	function self:wakeup(t)
 		if t[self.fieldmap.status] ~= 'R' then return end
@@ -1042,7 +1092,7 @@ function methods:put(t, opts)
 	local chan
 	if opts.wait then
 		chan = fiber.channel(1)
-		xq.put_wait[key] = chan
+		xq.put_wait[xq:packkey(key)] = chan
 	end
 
 	xq:atomic(key, function()
@@ -1051,9 +1101,12 @@ function methods:put(t, opts)
 	xq:wakeup(t)
 
 	if chan then
-		local res = chan:get(opts.wait)
-		if res then
-			return xq.retwrap(res), true
+		-- local func notify_producer will send to us some data
+		local msg = chan:get(opts.wait)
+		if msg then
+			xq.put_wait[xq:packkey(key)] = nil
+			chan:close()
+			return xq.retwrap(msg[1]), msg[2]
 		end
 	end
 	return xq.retwrap(t)
@@ -1244,7 +1297,7 @@ function methods:release(key, attr)
 			key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
 	end)
 	
-	xq:putback(key,attr)
+	xq:putback(t)
 	
 	return t
 end
@@ -1302,7 +1355,7 @@ function methods:ack(key, attr)
 		end
 	end)
 
-	xq:putback(key) -- in real drop form taken key
+	xq:putback(t) -- in real drop form taken key
 
 	return t
 end
