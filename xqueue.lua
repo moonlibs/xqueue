@@ -245,6 +245,8 @@ function M.upgrade(space,opts,depth)
 		self.bysid = space.xq.bysid
 		self._lock = space.xq._lock
 		self.take_wait = space.xq.take_wait
+		self.take_chans = space.xq.take_chans or setmetatable({}, { __mode = 'v' })
+		self.put_wait = space.xq.put_wait or setmetatable({}, { __mode = 'v' })
 		self._on_repl  = space.xq._on_repl
 		self._on_dis = space.xq._on_dis
 	else
@@ -252,7 +254,9 @@ function M.upgrade(space,opts,depth)
 		self.bysid = {}
 		-- byfid = {};
 		self._lock = {}
+		self.put_wait = setmetatable({}, { __mode = 'v' })
 		self.take_wait = fiber.channel(0)
+		self.take_chans = setmetatable({}, { __mode = 'v' })
 	end
 	setmetatable(self.bysid, {
 		__serialize='map',
@@ -296,7 +300,7 @@ function M.upgrade(space,opts,depth)
 	-- 1. fields check
 	local fields = {}
 	local fieldmap = {}
-	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"}}) do
+	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"},{"tube","str"}}) do
 		local fname,ftype = f[1], f[2]
 		local num = opts.fields[fname]
 		if num then
@@ -391,6 +395,14 @@ function M.upgrade(space,opts,depth)
 		end
 	end
 
+	function self:packkey(key)
+		if type(key) == 'cdata' then
+			return tostring(ffi.cast("uint64_t", key))
+		else
+			return key
+		end
+	end
+
 	do
 		local filter
 		if fields.priority then
@@ -415,9 +427,34 @@ function M.upgrade(space,opts,depth)
 		end
 		if not self.index then
 			if fields.priority then
-				error(string.format("not found index by status + priority + id"),2+depth)
+				error("not found index by status + priority + id",2+depth)
 			else
-				error(string.format("not found index by status + id"),2+depth)
+				error("not found index by status + id",2+depth)
+			end
+		end
+
+		if fields.tube then
+			for n,index in pairs(space.index) do
+				if type(n) == 'number' and index.parts[1].fieldno == fields.tube then
+					local not_match = false
+					for i = 2, #index.parts do
+						if index.parts[i].fieldno ~= self.index.parts[i-1].fieldno then
+							not_match = true
+							break
+						end
+					end
+					if not not_match then
+						self.tube_index = index
+						break
+					end
+				end
+			end
+			if not self.tube_index then
+				if fields.priority then
+					error("not found index by tube + status + priority + id",2+depth)
+				else
+					error("not found index by tube + status + id",2+depth)
+				end
 			end
 		end
 	end
@@ -585,6 +622,10 @@ function M.upgrade(space,opts,depth)
 		features.ttr = false
 	end
 
+	if fields.tube then
+		features.tube = true
+	end
+
 	self.gen_id = gen_id
 	self.features = features
 	self.space = space.id
@@ -606,6 +647,43 @@ function M.upgrade(space,opts,depth)
 	end
 	function self:keypack(t)
 		return t[pkf.no]
+	end
+
+	-- Notify producer if it is still waiting us.
+	-- Producer waits only for successfully processed task
+	-- or for task which would never be processed.
+	-- Discarding to process task depends on consumer's logic.
+	-- Also task can be deleted from space by exceeding TTL.
+	-- Producer should not be notified if queue is able to process task in future.
+	local function notify_producer(key, task)
+		local pkey = self:packkey(key)
+		local chan = self.put_wait[pkey]
+		if not chan or not chan:has_readers() then
+			-- no producer
+			return
+		end
+		if task.status == 'Z' or task.status == 'D' then
+			-- task was processed
+			chan:put({ task, true }, 0)
+			return
+		end
+		if not space:get{key} then
+			-- task is not present in space
+			-- it could be TTL or :ack
+			if task.status == 'T' then
+				-- task was acked:
+				chan:put({ task, true }, 0)
+			elseif task.status == 'R' then
+				-- task was killed by TTL
+				chan:put({ task, false }, 0)
+			end
+		else
+			-- task is still in space
+			if task.status == 'B' then
+				-- task was buried
+				chan:put({ task, false }, 0)
+			end
+		end
 	end
 
 	if opts.worker then
@@ -683,8 +761,10 @@ function M.upgrade(space,opts,depth)
 							})
 							xq:wakeup(u)
 						elseif t[xq.fields.status] == 'R' and xq.features.ttl then
-							log.info("Runat: Kill R by ttl %s (%+0.2fs)",xq:keyfield(t), fiber.time() - t[ xq.fields.runat ])
-							space:delete{ xq:keyfield(t) }
+							local key = xq:keyfield(t)
+							log.info("Runat: Kill R by ttl %s (%+0.2fs)", key, fiber.time() - t[ xq.fields.runat ])
+							t = space:delete{key}
+							notify_producer(key, t)
 						elseif t[xq.fields.status] == 'Z' and xq.features.zombie then
 							log.info("Runat: Kill Zombie %s",xq:keyfield(t))
 							space:delete{ xq:keyfield(t) }
@@ -761,7 +841,8 @@ function M.upgrade(space,opts,depth)
 		return t
 	end
 
-	function self:putback(key)
+	function self:putback(task)
+		local key = task[ self.key.no ]
 		local sid = self.taken[ key ]
 		if sid then
 			self.taken[ key ] = nil
@@ -773,12 +854,21 @@ function M.upgrade(space,opts,depth)
 		else
 			log.error( "Task {%s} not marked as taken, untake by sid=%s", key, box.session.id() )
 		end
-		-- TODO: putwait
-	end
 
+		notify_producer(key, task)
+	end
 
 	function self:wakeup(t)
 		if t[self.fieldmap.status] ~= 'R' then return end
+		if self.fieldmap.tube then
+			-- we may have consumers in the tubes:
+			local tube_chan = self.take_chans[t[self.fieldmap.tube]]
+			if tube_chan and tube_chan:has_readers() and tube_chan:put(true, 0) then
+				-- we have successfully notified consumer
+				return
+			end
+			-- otherwise fallback to default channel:
+		end
 		if self.take_wait:has_readers() then
 			self.take_wait:put(true,0)
 		end
@@ -924,6 +1014,9 @@ end
 			* if set, task will become `W` instead of `R` for `delay` seconds
 		+ `ttl` - number of seconds
 			* if set, task will be discarded after ttl seconds unless was taken
+		+ `wait` - number of seconds
+			* if set, callee fiber will be blocked up to `wait` seconds until task won't
+			be processed or timeout reached.
 
 ```lua
 box.space.myqueue:put{ name="xxx"; data="yyy"; }
@@ -973,6 +1066,10 @@ function methods:put(t, opts)
 		end
 		t[ xq.fieldmap.status ] = 'W'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.delay)
+
+		if opts.wait then
+			error("Are you crazy? Call of :put({...}, { wait = <>, delay = <> }) looks weird", 2)
+		end
 	elseif opts.ttl then
 		if not xq.features.ttl then
 			error("Feature ttl is not enabled",2)
@@ -992,11 +1089,26 @@ function methods:put(t, opts)
 	local tuple = xq.tuple(t)
 	local key = tuple[ xq.key.no ]
 
-	xq._lock[ key ] = true
-	t = self:insert( tuple )
-	xq._lock[ key ] = nil
+	local chan
+	if opts.wait then
+		chan = fiber.channel(1)
+		xq.put_wait[xq:packkey(key)] = chan
+	end
 
+	xq:atomic(key, function()
+		t = self:insert(tuple)
+	end)
 	xq:wakeup(t)
+
+	if chan then
+		-- local func notify_producer will send to us some data
+		local msg = chan:get(opts.wait)
+		if msg then
+			xq.put_wait[xq:packkey(key)] = nil
+			chan:close()
+			return xq.retwrap(msg[1]), msg[2]
+		end
+	end
 	return xq.retwrap(t)
 end
 
@@ -1007,6 +1119,7 @@ end
 	- `timeout` - number of seconds to wait for new task
 		+ choose reasonable time
 		+ beware of **readahead** size (see tarantool docs)
+	- `tube` - name of the tube worker wants to take task from (feature tube must be enabled)
 	- returns task tuple or table (see retval) or nothing on timeout
 	- *TODO*: ttr must be there
 ]]
@@ -1017,7 +1130,7 @@ function methods:take(timeout, opts)
 
 	if type(timeout) == 'table' then
 		opts = timeout
-		timeout = opts.timeout
+		timeout = opts.timeout or 0
 	else
 		opts = opts or {}
 	end
@@ -1033,15 +1146,33 @@ function methods:take(timeout, opts)
 		ttr = xq.features.ttr_default
 	end
 
+	local index
+	local start_with
+
+	local tube_chan
+	if opts.tube then
+		if not xq.features.tube then
+			error("Feature tube is not enabled", 2)
+		end
+
+		assert(type(opts.tube) == 'string', "opts.tube must be a string")
+
+		index = xq.tube_index
+		start_with = {opts.tube, 'R'}
+		tube_chan = xq.take_chans[opts.tube] or fiber.channel()
+		xq.take_chans[opts.tube] = tube_chan
+	else
+		index = xq.index
+		start_with = {'R'}
+	end
+
 	local now = fiber.time()
 	local key
 	local found
 	while not found do
-		for _,t in xq.index:pairs({'R'},{ iterator = box.index.EQ }) do
+		for _,t in index:pairs(start_with, { iterator = box.index.EQ }) do
 			key = t[ xq.key.no ]
-			if xq._lock[ key ] then
-				-- continue
-			else
+			if not xq._lock[ key ] then
 				-- found key
 				xq._lock[ key ] = true
 				found = t
@@ -1050,13 +1181,22 @@ function methods:take(timeout, opts)
 		end
 		if not found then
 			local left = (now + timeout) - fiber.time()
-			if left <= 0 then return end
-			xq.take_wait:get(left)
-			if box.session.storage.destroyed then return end
-		else
-			break
+			if left <= 0 then goto finish end
+
+			(tube_chan or xq.take_wait):get(left)
+			if box.session.storage.destroyed then goto finish end
 		end
 	end
+	::finish::
+
+	-- If we were last reader from the tube
+	-- we remove channel. Writers will get false
+	-- on :put if they exists.
+	if tube_chan and not tube_chan:has_readers() then
+		tube_chan:close()
+		xq.take_chans[opts.tube] = nil
+	end
+	if not found then return end
 
 	local r,e = pcall(function()
 		local sid = box.session.id()
@@ -1157,7 +1297,7 @@ function methods:release(key, attr)
 			key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
 	end)
 	
-	xq:putback(key,attr)
+	xq:putback(t)
 	
 	return t
 end
@@ -1215,7 +1355,7 @@ function methods:ack(key, attr)
 		end
 	end)
 
-	xq:putback(key) -- in real drop form taken key
+	xq:putback(t) -- in real drop form taken key
 
 	return t
 end
