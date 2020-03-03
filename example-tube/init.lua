@@ -118,6 +118,24 @@ do
 	end
 end
 
+box.space.utube:put {
+	tube    = "tube-1",
+	payload = {
+		ctime = require 'clock'.realtime64(),
+	},
+	nice = 0,
+}
+
+do
+	local task = box.space.utube:take(0)
+	test:ok(task, ":take returned task from queue")
+	box.space.utube:bury({ task.id })
+
+	task = box.space.utube:get{task.id}
+
+	test:ok(task.status, "B", "task was successfully buried")
+end
+
 -- clears queue:
 box.space.utube:truncate()
 

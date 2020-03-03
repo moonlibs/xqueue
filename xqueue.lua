@@ -1360,16 +1360,12 @@ function methods:ack(key, attr)
 	return t
 end
 
-function methods:bury(task, attr)
-	local xq   = self.xq
-	local key  = xq:getkey(task)
-	local peer = box.session.storage.peer
-	local sid  = box.session.id()
-	attr       = attr or {}
+function methods:bury(key, attr)
+	attr = attr or {}
 
-	if xq.debug then
-		log.info("Bury {%s} by %s, sid=%s, fid=%s", key, peer, sid, fiber.id())
-	end
+	local xq = self.xq
+	key = xq:getkey(key)
+	local t = xq:check_owner(key)
 
 	local update = {}
 	if attr.update then
@@ -1377,9 +1373,17 @@ function methods:bury(task, attr)
 	end
 	table.insert(update, { '=', xq.fields.status, 'B' })
 
-	self:update({key}, update)
+	xq:atomic(key,function()
+		t = self:update({key}, update)
 
-	xq:putback(key, attr)
+		xq:wakeup(t)
+		if xq.have_runat then
+			xq.runat_chan:put(true,0)
+		end
+		log.info("Bury {%s} by %s, sid=%s, fid=%s", key, box.session.storage.peer, box.session.id(), fiber.id())
+	end)
+
+	xq:putback(t)
 end
 
 local function kick_task(self, key, attr)
