@@ -686,6 +686,8 @@ function M.upgrade(space,opts,depth)
 		end
 	end
 
+	self.ready = fiber.channel(0)
+
 	if opts.worker then
 		local workers = opts.workers or 1
 		local worker = opts.worker
@@ -697,6 +699,10 @@ function M.upgrade(space,opts,depth)
 				repeat fiber.sleep(0.001) until space.xq
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
+				if box.info.ro then
+					log.notice("Shutting down on ro instance")
+					return
+				end
 				while box.space[space.name] and space.xq == xq do
 					local task = space:take(1)
 					if task then
@@ -731,6 +737,10 @@ function M.upgrade(space,opts,depth)
 			if xq.ready then xq.ready:get() end
 			local chan = xq.runat_chan
 			log.info("Runat started")
+			if box.info.ro then
+				log.notice("Shutting down on ro instance")
+				return
+			end
 			local maxrun = 1000
 			local curwait
 			local collect = {}
@@ -881,7 +891,6 @@ function M.upgrade(space,opts,depth)
 		end
 		self.ready = nil
 	end
-	self.ready = fiber.channel(0)
 	
 	local meta = debug.getmetatable(space)
 	for k,v in pairs(methods) do meta[k] = v end
