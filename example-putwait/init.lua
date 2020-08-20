@@ -69,7 +69,7 @@ require 'xqueue'.upgrade(box.space.myqueue, {
 local test = require 'tap'.test("putwait")
 local fiber = require 'fiber'
 
-fiber.create(function()
+local function worker()
 	-- worker:
 	fiber.yield()
 
@@ -92,22 +92,43 @@ fiber.create(function()
 
 	-- Yeah! We've managed to process it:
 	box.space.myqueue:ack(task)
-end)
+end
 
--- producer:
-local task, processed = box.space.myqueue:put({
-	id = 1, payload = { initiated = true }
-}, { wait = 3 })
+do
+	-- consumer:
+	fiber.create(worker)
+	-- producer:
+	local task, processed = box.space.myqueue:put({
+		id = 1, payload = { initiated = true }
+	}, { wait = 3 })
 
-test:ok(task, "task was returned for producer")
-test:ok(processed, "task was processed")
-test:is(box.space.myqueue:len(), 0, "queue is empty")
+	test:ok(task, "task was returned for producer")
+	test:ok(processed, "task was processed")
+	test:is(box.space.myqueue:len(), 0, "queue is empty")
 
-task, processed = box.space.myqueue:put({
-	id = 2, payload = newmap(),
-}, { wait = 2, ttl = 1 })
-test:ok(task, "task was returned for producer")
-test:is(processed, false, "task wasn't processed because was killed by TTL")
-test:is(box.space.myqueue:len(), 0, "queue is empty")
+	task, processed = box.space.myqueue:put({
+		id = 2, payload = newmap(),
+	}, { wait = 2, ttl = 1 })
+	test:ok(task, "task was returned for producer")
+	test:is(processed, false, "task wasn't processed because was killed by TTL")
+	test:is(box.space.myqueue:len(), 0, "queue is empty")
+end
+
+do
+	-- consumer:
+	fiber.create(worker)
+	-- producer:
+	local task = box.space.myqueue:put({
+		id = 3, payload = { initiated = true }
+	})
+
+	local processed
+	task, processed = box.space.myqueue:wait(task, 3)
+	test:ok(task, "task was returned for producer")
+	test:ok(processed, "task was processed")
+
+	test:is(box.space.myqueue:len(), 0, "queue is empty")
+end
+
 
 os.exit()
