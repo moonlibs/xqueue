@@ -657,14 +657,17 @@ function M.upgrade(space,opts,depth)
 	-- Producer should not be notified if queue is able to process task in future.
 	local function notify_producer(key, task)
 		local pkey = self:packkey(key)
-		local chan = self.put_wait[pkey]
-		if not chan or not chan:has_readers() then
+		local wait = self.put_wait[pkey]
+		if not wait then
 			-- no producer
 			return
 		end
+
 		if task.status == 'Z' or task.status == 'D' then
 			-- task was processed
-			chan:put({ task, true }, 0)
+			wait.task = task
+			wait.processed = true
+			wait.cond:broadcast()
 			return
 		end
 		if not space:get{key} then
@@ -672,16 +675,22 @@ function M.upgrade(space,opts,depth)
 			-- it could be TTL or :ack
 			if task.status == 'T' then
 				-- task was acked:
-				chan:put({ task, true }, 0)
+				wait.task = task
+				wait.processed = true
+				wait.cond:broadcast()
 			elseif task.status == 'R' then
 				-- task was killed by TTL
-				chan:put({ task, false }, 0)
+				wait.task = task
+				wait.processed = false
+				wait.cond:broadcast()
 			end
 		else
 			-- task is still in space
 			if task.status == 'B' then
 				-- task was buried
-				chan:put({ task, false }, 0)
+				wait.task = task
+				wait.processed = false
+				wait.cond:broadcast()
 			end
 		end
 	end
@@ -1098,10 +1107,10 @@ function methods:put(t, opts)
 	local tuple = xq.tuple(t)
 	local key = tuple[ xq.key.no ]
 
-	local chan
+	local wait
 	if opts.wait then
-		chan = fiber.channel(1)
-		xq.put_wait[xq:packkey(key)] = chan
+		wait = { cond = fiber.cond() }
+		xq.put_wait[xq:packkey(key)] = wait
 	end
 
 	xq:atomic(key, function()
@@ -1109,16 +1118,60 @@ function methods:put(t, opts)
 	end)
 	xq:wakeup(t)
 
-	if chan then
+	if wait then
 		-- local func notify_producer will send to us some data
-		local msg = chan:get(opts.wait)
-		if msg then
-			xq.put_wait[xq:packkey(key)] = nil
-			chan:close()
-			return xq.retwrap(msg[1]), msg[2]
+		local ok = wait.cond:wait(opts.wait)
+		fiber.testcancel()
+		if ok and wait.task then
+			return xq.retwrap(wait.task), wait.processed
 		end
 	end
 	return xq.retwrap(t)
+end
+
+--[[
+* `space:wait(id, timeout)`
+	- `id`:
+		+ `string` | `number` - primary key
+	- `timeout` - number of seconds to wait
+		* callee fiber will be blocked up to `timeout` seconds until task won't
+		be processed or timeout reached.
+]]
+
+local wait_for = {
+	R = true,
+	T = true,
+	W = true,
+}
+
+function methods:wait(key, timeout)
+	local xq = self.xq
+	key = xq:getkey(key)
+	local task = self:get(key)
+	if not task then
+		error(("Task {%s} was not found"):format(key))
+	end
+
+	local status = task[xq.fields.status]
+	if not wait_for[status] then
+		return xq.retwrap(task), false
+	end
+
+	local pkey = xq:packkey(key)
+	local wait = xq.put_wait[pkey]
+	if not wait then
+		wait = { cond = fiber.cond() }
+		xq.put_wait[pkey] = wait
+	end
+
+	-- local func notify_producer will send to us some data
+	local ok = wait.cond:wait(timeout)
+	fiber.testcancel()
+	if ok and wait.task then
+		return xq.retwrap(wait.task), wait.processed
+	end
+
+	return xq.retwrap(task), false
 end
 
 --[[
