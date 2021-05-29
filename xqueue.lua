@@ -1158,7 +1158,7 @@ function methods:put(t, opts)
 	end
 
 	-- check lock index
-	if xq.features.lockable and t[ xq.fieldmap.status ] == 'R' then
+	if xq.features.lockable and t[ xq.fieldmap.status ] == 'R' and t[ xq.fieldmap.lock ] ~= nil then
 		-- check if we need to set status L or R by looking up tasks in L, R or T states
 		local locker_t
 		for _, status in ipairs({'L', 'T', 'R'}) do
@@ -1484,7 +1484,7 @@ function methods:ack(key, attr)
 				key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
 		end
 
-		if xq.features.lockable then
+		if xq.features.lockable and t[ xq.fieldmap.lock ] ~= nil then
 			-- find any task that is locked
 			xq:wakeup_locked_task(t)
 		end
@@ -1517,7 +1517,7 @@ function methods:bury(key, attr)
 		end
 		log.info("Bury {%s} by %s, sid=%s, fid=%s", key, box.session.storage.peer, box.session.id(), fiber.id())
 
-		if features.lockable then
+		if xq.features.lockable and t[ xq.fieldmap.lock ] ~= nil then
  			xq:wakeup_locked_task(t)
 		end
 	end)
@@ -1575,7 +1575,7 @@ function methods:kill(key)
 		xq.taken[key] = nil
 		xq._lock[key] = nil
 
-		if xq.feature.lockable then
+		if xq.features.lockable and t[ xq.fieldmap.lock ] ~= nil then
 			xq:wakeup_locked_task(task)
 		end
 	end
