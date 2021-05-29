@@ -84,6 +84,9 @@ Status:
 
 	D - done - task was processed and ack'ed and permanently left in database
 		enabled when keep feature is set
+
+	L - locked - task is locked via `lock' index. Tasks will be processed only 
+		if there are no older tasks by `lock` index
 	
 	X - reserved for statistics
 
@@ -102,6 +105,7 @@ Interface:
 			status   = 'status_field_name'    | status_field_no,
 			runat    = 'runat_field_name'     | runat_field_no,
 			priority = 'priority_field_name'  | priority_field_no,
+			lock     = 'lock_field_name'      | lock_field_no,
 		},
 		features = {
 			id = 'auto_increment' | 'uuid' | 'required' | function
@@ -300,7 +304,7 @@ function M.upgrade(space,opts,depth)
 	-- 1. fields check
 	local fields = {}
 	local fieldmap = {}
-	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"},{"tube","str"}}) do
+	for _,f in pairs({{"status","str"},{"runat","num"},{"priority","num"},{"tube","str"},{"lock","*"}}) do
 		local fname,ftype = f[1], f[2]
 		local num = opts.fields[fname]
 		if num then
@@ -320,7 +324,7 @@ function M.upgrade(space,opts,depth)
 				error(string.format("wrong type %s for field %s, number or string required",type(num),fname),2 + depth)
 			end
 			-- check type
-			if format[num] then
+			if format[num] and ftype ~= "*" then
 				if not typeeq(format[num].type, ftype) then
 					error(string.format("type mismatch for field %s, required %s, got %s",fname, ftype, format[fname].type),2+depth)
 				end
@@ -456,6 +460,23 @@ function M.upgrade(space,opts,depth)
 					error("not found index by tube + status + id",2+depth)
 				end
 			end
+		end
+
+		if fields.lock then
+			local lock_index
+			for _,index in pairs(space.index) do
+				if type(_) == 'number' and #index.parts >= 2 then
+					if index.parts[1].fieldno == fields.lock and index.parts[2].fieldno == fields.status then
+						-- print("found lock index", index.name)
+						lock_index = index
+						break
+					end
+				end
+			end
+			if not lock_index then
+				error(string.format("fields.lock requires tree index with at least fields (`lock', `status', ...)"), 2+depth)
+			end
+			self.lock_index = lock_index
 		end
 	end
 
@@ -626,6 +647,16 @@ function M.upgrade(space,opts,depth)
 		features.tube = true
 	end
 
+	if fields.lock then
+		features.lockable = true
+	end
+
+	if features.lockable then
+		if features.ttl or features.delayed or features.ttl_default then
+			error(string.format("feature lockable cannot be combined with delayed or ttl"), 2+depth)
+		end
+	end
+
 	self.gen_id = gen_id
 	self.features = features
 	self.space = space.id
@@ -647,6 +678,19 @@ function M.upgrade(space,opts,depth)
 	end
 	function self:keypack(t)
 		return t[pkf.no]
+	end
+
+	function self:wakeup_locked_task(t)
+		local locker_t = self.lock_index:select({ t[ self.fieldmap.lock ], 'L' }, {limit=1})[1]
+		if locker_t ~= nil then
+			locker_t = box.space[self.space]:update({ locker_t[ self.key.no ] }, {
+				{ '=', self.fields.status, 'R' }
+			})
+			log.info("Unlock: L->R {%s} (by %s) from %s/sid=%s/fid=%s",
+				self:getkey(locker_t), self:getkey(t), box.session.storage.peer, box.session.id(), fiber.id() )
+			self:wakeup(locker_t)
+		end
+		return locker_t
 	end
 
 	-- Notify producer if it is still waiting us.
@@ -1082,6 +1126,9 @@ function methods:put(t, opts)
 		if opts.ttl then
 			error("Features ttl and delay are mutually exclusive",2)
 		end
+		if xq.features.lockable then
+			error("Delay is not supported for lockable queues")
+		end
 		t[ xq.fieldmap.status ] = 'W'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.delay)
 
@@ -1092,9 +1139,15 @@ function methods:put(t, opts)
 		if not xq.features.ttl then
 			error("Feature ttl is not enabled",2)
 		end
+		if xq.features.lockable then
+			error("TTL is not supported for lockable queues")
+		end
 		t[ xq.fieldmap.status ] = 'R'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.ttl)
 	elseif xq.features.ttl_default then
+		if xq.features.lockable then
+			error("Delay is not supported for lockable queues")
+		end
 		t[ xq.fieldmap.status ] = 'R'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(xq.features.ttl_default)
 	elseif xq.have_runat then
@@ -1102,6 +1155,20 @@ function methods:put(t, opts)
 		t[ xq.fieldmap.runat ]  = xq.NEVER
 	else
 		t[ xq.fieldmap.status ] = 'R'
+	end
+
+	-- check lock index
+	if xq.features.lockable and t[ xq.fieldmap.status ] == 'R' then
+		-- check if we need to set status L or R by looking up tasks in L, R or T states
+		local locker_t
+		for _, status in ipairs({'L', 'T', 'R'}) do
+			locker_t = xq.lock_index:select({ t[ xq.fieldmap.lock ], status }, {limit=1})[1]
+			if locker_t ~= nil then
+				-- there is a task that should be processed first
+				t[ xq.fieldmap.status ] = 'L'
+				break
+			end
+		end
 	end
 
 	local tuple = xq.tuple(t)
@@ -1142,6 +1209,7 @@ local wait_for = {
 	R = true,
 	T = true,
 	W = true,
+	L = true,
 }
 
 function methods:wait(key, timeout)
@@ -1415,6 +1483,11 @@ function methods:ack(key, attr)
 			log.info("Ack: %s->delete {%s} +%s from %s/sid=%s/fid=%s", old,
 				key, attr.delay, box.session.storage.peer, box.session.id(), fiber.id() )
 		end
+
+		if xq.features.lockable then
+			-- find any task that is locked
+			xq:wakeup_locked_task(t)
+		end
 	end)
 
 	xq:putback(t) -- in real drop form taken key
@@ -1443,6 +1516,10 @@ function methods:bury(key, attr)
 			xq.runat_chan:put(true,0)
 		end
 		log.info("Bury {%s} by %s, sid=%s, fid=%s", key, box.session.storage.peer, box.session.id(), fiber.id())
+
+		if features.lockable then
+ 			xq:wakeup_locked_task(t)
+		end
 	end)
 
 	xq:putback(t)
@@ -1497,6 +1574,10 @@ function methods:kill(key)
 		end
 		xq.taken[key] = nil
 		xq._lock[key] = nil
+
+		if xq.feature.lockable then
+			xq:wakeup_locked_task(task)
+		end
 	end
 end
 
@@ -1527,6 +1608,7 @@ local pretty_st = {
 	B = "Buried",
 	Z = "Zombie",
 	D = "Done",
+	L = "Locked",
 }
 
 function methods:stats(pretty)
