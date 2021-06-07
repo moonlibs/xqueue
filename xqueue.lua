@@ -651,12 +651,6 @@ function M.upgrade(space,opts,depth)
 		features.lockable = true
 	end
 
-	if features.lockable then
-		if features.ttl or features.delayed or features.ttl_default then
-			error(string.format("feature lockable cannot be combined with delayed or ttl"), 2+depth)
-		end
-	end
-
 	self.gen_id = gen_id
 	self.features = features
 	self.space = space.id
@@ -691,6 +685,18 @@ function M.upgrade(space,opts,depth)
 			self:wakeup(locker_t)
 		end
 		return locker_t
+	end
+
+	function self:find_locker_task(lock_value)
+		local locker_t
+		for _, status in ipairs({'L', 'T', 'R'}) do
+			locker_t = self.lock_index:select({ lock_value, status }, {limit=1})[1]
+			if locker_t ~= nil then
+				-- there is a task that should be processed first
+				return locker_t
+			end
+		end
+		return nil
 	end
 
 	-- Notify producer if it is still waiting us.
@@ -813,25 +819,35 @@ function M.upgrade(space,opts,depth)
 						if #collect >= maxrun then remaining = 0 break end
 					end
 					
+					local status
 					for _,t in ipairs(collect) do
 						-- log.info("Runat: %s, %s", _, t)
-						if t[xq.fields.status] == 'W' then
-							log.info("Runat: W->R %s",xq:keyfield(t))
+						status = t[ xq.fields.status ]
+
+						if status == 'W' then
+							local target_status = 'R'
+							if xq.features.lockable and t[ xq.fieldmap.lock ] ~= nil then
+								-- check if we need to set status L or R by looking up locker task
+								if xq:find_locker_task(t[ xq.fieldmap.lock ]) ~= nil then
+									target_status = 'L'
+								end
+							end
+							log.info("Runat: W->%s %s",target_status,xq:keyfield(t))
 							-- TODO: default ttl?
 							local u = space:update({ xq:keyfield(t) },{
-								{ '=',xq.fields.status,'R' },
+								{ '=',xq.fields.status,target_status },
 								{ '=',xq.fields.runat, xq.NEVER }
 							})
 							xq:wakeup(u)
-						elseif t[xq.fields.status] == 'R' and xq.features.ttl then
+						elseif (status == 'R' or status == 'L') and xq.features.ttl then
 							local key = xq:keyfield(t)
 							log.info("Runat: Kill R by ttl %s (%+0.2fs)", key, fiber.time() - t[ xq.fields.runat ])
 							t = space:delete{key}
 							notify_producer(key, t)
-						elseif t[xq.fields.status] == 'Z' and xq.features.zombie then
+						elseif status == 'Z' and xq.features.zombie then
 							log.info("Runat: Kill Zombie %s",xq:keyfield(t))
 							space:delete{ xq:keyfield(t) }
-						elseif t[xq.fields.status] == 'T' and xq.features.ttr then
+						elseif status == 'T' and xq.features.ttr then
 							local key = xq:keypack(t)
 							local sid = xq.taken[ key ]
 							local peer = peers[sid] or sid
@@ -847,7 +863,7 @@ function M.upgrade(space,opts,depth)
 							end
 							xq:wakeup(u)
 						else
-							log.error("Runat: unsupported status %s for %s",t[xq.fields.status], tostring(t))
+							log.error("Runat: unsupported status %s for %s",status, tostring(t))
 							space:update({ xq:keyfield(t) },{
 								{ '=',xq.fields.runat, xq.NEVER }
 							})
@@ -1126,9 +1142,6 @@ function methods:put(t, opts)
 		if opts.ttl then
 			error("Features ttl and delay are mutually exclusive",2)
 		end
-		if xq.features.lockable then
-			error("Delay is not supported for lockable queues")
-		end
 		t[ xq.fieldmap.status ] = 'W'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.delay)
 
@@ -1139,15 +1152,9 @@ function methods:put(t, opts)
 		if not xq.features.ttl then
 			error("Feature ttl is not enabled",2)
 		end
-		if xq.features.lockable then
-			error("TTL is not supported for lockable queues")
-		end
 		t[ xq.fieldmap.status ] = 'R'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(opts.ttl)
 	elseif xq.features.ttl_default then
-		if xq.features.lockable then
-			error("Delay is not supported for lockable queues")
-		end
 		t[ xq.fieldmap.status ] = 'R'
 		t[ xq.fieldmap.runat ]  = xq.timeoffset(xq.features.ttl_default)
 	elseif xq.have_runat then
@@ -1160,14 +1167,8 @@ function methods:put(t, opts)
 	-- check lock index
 	if xq.features.lockable and t[ xq.fieldmap.status ] == 'R' and t[ xq.fieldmap.lock ] ~= nil then
 		-- check if we need to set status L or R by looking up tasks in L, R or T states
-		local locker_t
-		for _, status in ipairs({'L', 'T', 'R'}) do
-			locker_t = xq.lock_index:select({ t[ xq.fieldmap.lock ], status }, {limit=1})[1]
-			if locker_t ~= nil then
-				-- there is a task that should be processed first
-				t[ xq.fieldmap.status ] = 'L'
-				break
-			end
+		if xq:find_locker_task(t[ xq.fieldmap.lock ]) ~= nil then
+			t[ xq.fieldmap.status ] = 'L'
 		end
 	end
 

@@ -15,12 +15,14 @@ require 'strict'.on()
 
 		{name = "action", type = "string"},
 		{name = "attr",   type = "*"},
+		{name = "runat",   type = "number"},
 	}
 	box.schema.space.create('tasks', { if_not_exists = true, format = format })
 
 	box.space.tasks:create_index('primary', { unique = true, parts = {'id'}, if_not_exists = true})
 	box.space.tasks:create_index('xq', { unique = false, parts = { 'status', 'id' }, if_not_exists = true})
 	box.space.tasks:create_index('lock', { unique = false, parts = { 'lock', 'status', 'id' }, if_not_exists = true})
+	box.space.tasks:create_index('runat', { unique = false, parts = { 'runat', 'id' }, if_not_exists = true})
 -- end)
 
 if not package.path:match('%.%./%?%.lua;') then
@@ -32,22 +34,26 @@ require 'xqueue' ( box.space.tasks, {
 	fields = {
 		status = 'status';
 		lock  = 'lock';
+		runat  = 'runat';
 	};
 	features = {
 		id = 'uuid',
+		delayed = true,
+		ttl = true,
 	};
-	workers = 1;
+	workers = 0;
 	worker = function(task)
 		print(require'fiber'.self().id(), "got task",task.id, require'yaml'.encode(box.space.tasks:select()))
+		require'fiber'.sleep(10)
 	end;
 } )
 
 
 print(require'yaml'.encode(box.space.tasks:select()))
-for i = 1, 10 do
-	local t = box.space.tasks:put{ lock=1, action = "doit", attr = {} }
-	print('inserted', t.id, t.status)
-end
+-- for i = 1, 5 do
+-- 	local t = box.space.tasks:put{ lock=1, action = "doit", attr = {} }
+-- 	print('inserted', t.id, t.status)
+-- end
 
 require'console'.start()
 os.exit()
