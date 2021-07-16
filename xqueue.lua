@@ -759,7 +759,7 @@ function M.upgrade(space,opts,depth)
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
 				if box.info.ro then
-					log.notice("Shutting down on ro instance")
+					log.info("Shutting down on ro instance")
 					return
 				end
 				while box.space[space.name] and space.xq == xq do
@@ -797,7 +797,7 @@ function M.upgrade(space,opts,depth)
 			local chan = xq.runat_chan
 			log.info("Runat started")
 			if box.info.ro then
-				log.notice("Shutting down on ro instance")
+				log.info("Shutting down on ro instance")
 				return
 			end
 			local maxrun = 1000
