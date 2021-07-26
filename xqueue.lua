@@ -247,6 +247,7 @@ function M.upgrade(space,opts,depth)
 		self.taken = space.xq.taken
 		self._stat = space.xq._stat
 		self.bysid = space.xq.bysid
+		self.sid_take_fids = space.xq.sid_take_fids
 		self._lock = space.xq._lock
 		self.take_wait = space.xq.take_wait
 		self.take_chans = space.xq.take_chans or setmetatable({}, { __mode = 'v' })
@@ -256,6 +257,7 @@ function M.upgrade(space,opts,depth)
 	else
 		self.taken = {}
 		self.bysid = {}
+		self.sid_take_fids = {}
 		-- byfid = {};
 		self._lock = {}
 		self.put_wait = setmetatable({}, { __mode = 'v' })
@@ -674,6 +676,25 @@ function M.upgrade(space,opts,depth)
 		return t[pkf.no]
 	end
 
+	function self:register_take_fid()
+		local sid = box.session.id()
+		local fid = fiber.id()
+		if self.sid_take_fids[sid] == nil then
+			self.sid_take_fids[sid] = {}
+		end
+		self.sid_take_fids[sid][fid] = true
+	end
+
+	function self:deregister_take_fid()
+		local sid = box.session.id()
+		local fid = fiber.id()
+		if self.sid_take_fids[sid] == nil then
+			return
+		end
+
+		self.sid_take_fids[sid][fid] = nil
+	end
+
 	function self:wakeup_locked_task(t)
 		local locker_t = self.lock_index:select({ t[ self.fieldmap.lock ], 'L' }, {limit=1})[1]
 		if locker_t ~= nil then
@@ -1027,6 +1048,15 @@ function M.upgrade(space,opts,depth)
 			end
 			self.bysid[sid] = nil
 		end
+
+		if self.sid_take_fids[sid] then
+			for fid in pairs(self.sid_take_fids[sid]) do
+				log.info('Killing take fiber %d in sid %d', fid, sid)
+				fiber.kill(fid)
+			end
+
+			self.sid_take_fids[sid] = nil
+		end
 	end, self._on_dis)
 	
 	rawset(space,'xq',self)
@@ -1297,6 +1327,7 @@ function methods:take(timeout, opts)
 		start_with = {'R'}
 	end
 
+	local wait_chan = (tube_chan or xq.take_wait)
 	local now = fiber.time()
 	local key
 	local found
@@ -1313,8 +1344,14 @@ function methods:take(timeout, opts)
 		if not found then
 			local left = (now + timeout) - fiber.time()
 			if left <= 0 then goto finish end
-
-			(tube_chan or xq.take_wait):get(left)
+			
+			self.xq:register_take_fid()
+			local ok, r = pcall(wait_chan.get, wait_chan, left)
+			self.xq:deregister_take_fid()
+			if not ok then 
+				log.info('take finished abruptly: %s', r)
+				goto finish 
+			end
 			if box.session.storage.destroyed then goto finish end
 		end
 	end
