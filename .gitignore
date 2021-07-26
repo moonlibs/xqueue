@@ -1,2 +1,3 @@
 **/*.xlog
 **/*.snap
+.DS_Store
