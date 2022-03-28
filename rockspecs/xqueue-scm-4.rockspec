@@ -1,7 +1,7 @@
 package = 'xqueue'
 version = 'scm-4'
 source  = {
-    url    = 'git://github.com/moonlibs/xqueue.git',
+    url    = 'git+https://github.com/moonlibs/xqueue.git',
     branch = 'master',
 }
 description = {
