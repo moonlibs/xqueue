@@ -1,4 +1,5 @@
 std = "luajit"
+codes = true
 globals = {
 	-- Tarantool variable:
 	"box",
@@ -10,8 +11,11 @@ globals = {
 }
 
 ignore = {
--- 	"211",
+	"211",
+	"212",
+	"431",
+	"432",
+	"542",
 	"611",
 -- 	"631",
--- 	"542"
 }
