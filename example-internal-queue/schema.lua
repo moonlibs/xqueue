@@ -15,23 +15,23 @@ local spacer = require 'spacer'
 ---@field error map? error (temporary or final) of single task processing.
 
 spacer.create_space('queue', {
-    { name = 'id',      type = 'unsigned' },
-    { name = 'nice',    type = 'number'   },
-    { name = 'status',  type = 'string'   },
-    { name = 'tube',    type = 'string', is_nullable = true },
-    { name = 'kind',    type = 'string'   },
+	{ name = 'id',      type = 'unsigned' },
+	{ name = 'nice',    type = 'number'   },
+	{ name = 'status',  type = 'string'   },
+	{ name = 'tube',    type = 'string', is_nullable = true },
+	{ name = 'kind',    type = 'string'   },
 	{ name = 'dedup',   type = 'string'   },
-    { name = 'attempt', type = 'number'   },
-    { name = 'runat',   type = 'number'   },
+	{ name = 'attempt', type = 'number'   },
+	{ name = 'runat',   type = 'number'   },
 	{ name = 'mtime',   type = 'number', is_nullable = true },
-    { name = 'payload', type = 'map'      },
-    { name = 'result',  type = 'map'      },
+	{ name = 'payload', type = 'map'      },
+	{ name = 'result',  type = 'map'      },
 	{ name = 'error',   type = 'map', is_nullable = true },
 }, {
-    { name = 'id',         type = 'TREE', parts = { 'id' } },
+	{ name = 'id',         type = 'TREE', parts = { 'id' } },
 	{ name = 'xq',         type = 'TREE', parts = { 'status', 'nice', 'id' } },
-    { name = 'tube',       type = 'TREE', parts = { 'tube', 'status', 'nice', 'id' } },
-    { name = 'runat',      type = 'TREE', parts = { 'runat', 'id' } },
+	{ name = 'tube',       type = 'TREE', parts = { 'tube', 'status', 'nice', 'id' } },
+	{ name = 'runat',      type = 'TREE', parts = { 'runat', 'id' } },
 	{ name = 'dedup_kind', type = 'TREE', parts = { 'dedup', 'kind' } },
 })
 

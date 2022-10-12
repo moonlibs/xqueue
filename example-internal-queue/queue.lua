@@ -68,9 +68,9 @@ end
 
 
 function M:__serialize()
-    local space = self.q
-    return ("Queue <%s:%d:%.2fMb> %s"):format(
-        self.q.name, space:len(), tonumber(space:bsize()) / 1024 / 1024,
+	local space = self.q
+	return ("Queue <%s:%d:%.2fMb> %s"):format(
+		self.q.name, space:len(), tonumber(space:bsize()) / 1024 / 1024,
 		json.encode(self:stats().counts)
 	)
 end
@@ -91,66 +91,66 @@ end
 ---@param cfg QueueConfiguration configuration of queue
 ---@return Queue
 function M:_init(cfg)
-    local space = assert(box.space[cfg.space], ("space %s does not exists"):format(cfg.space))
+	local space = assert(box.space[cfg.space], ("space %s does not exists"):format(cfg.space))
 
-    xqueue.upgrade(space, {
+	xqueue.upgrade(space, {
 		debug = true,
-        fields = {
-            status   = 'status',
-            priority = 'nice',
-            tube     = 'tube',
+		fields = {
+			status   = 'status',
+			priority = 'nice',
+			tube     = 'tube',
 			runat    = 'runat',
-        },
-        features = {
-            id = 'time64',
-            retval = 'tuple',
-            buried = true,
-            delayed = true,
-            keep = cfg.keep,
+		},
+		features = {
+			id = 'time64',
+			retval = 'tuple',
+			buried = true,
+			delayed = true,
+			keep = cfg.keep,
 
-            zombie = cfg.zombie,
-            zombie_delay = cfg.zombie_delay,
+			zombie = cfg.zombie,
+			zombie_delay = cfg.zombie_delay,
 
-            ttl = false,
+			ttl = false,
 			ttr = false,
 		},
-    })
+	})
 
 	cfg.backoff = cfg.backoff or {}
 
-    self.opts = {}
-    self.opts.take_timeout = cfg.take_timeout or 1
-    self.opts.backoff = cfg.backoff
-    self.opts.backoff.max_delay = cfg.backoff.max_delay or 3600
+	self.opts = {}
+	self.opts.take_timeout = cfg.take_timeout or 1
+	self.opts.backoff = cfg.backoff
+	self.opts.backoff.max_delay = cfg.backoff.max_delay or 3600
 	self.opts.backoff.max_attempt = cfg.backoff.max_attempt or 100
-    self.opts.backoff.delay_base = cfg.backoff.delay_base or 1.5
-    self.opts.tubes = cfg.tubes or {}
-    self.opts.autostart = cfg.autostart
+	self.opts.backoff.delay_base = cfg.backoff.delay_base or 1.5
+	self.opts.tubes = cfg.tubes or {}
+	self.opts.autostart = cfg.autostart
 	self.opts.process_timeout = cfg.process_timeout or 60
 
 	---@type table<string, {job: any, task: Task, taken_at: number}>
 	self._task_map = {}
 
 	---@cast space xqueueSpace
-    self.q = space
+	self.q = space
 
-    self._on = {}
-    self.handlers = {}
+	self._on = {}
+	self.handlers = {}
 
 	for _, t in ipairs(self.opts.tubes) do
 		self:spawn(t.workers, t.tube)
-    end
+	end
 
 	if cfg.workers then
 		self:spawn(cfg.workers)
-    end
+	end
 
-    self.monitor = background {
-        name = 'qmon',
-        eternal = false,
-        restart = 5,
-        run_interval = 10,
-        func = function(job) self:_check_workers(job) end,
+	self.monitor = background {
+		name = 'qmon',
+		eternal = false,
+		restart = 5,
+		run_interval = 10,
+		func = function(job) self:_check_workers(job) end,
 		on_fail = function(_,err) self:on_fail(err) end,
 	}
 
@@ -166,19 +166,19 @@ function M:_check_workers(_)
 		if taken_info.taken_at + self.opts.process_timeout < fiber.time() then
 			table.insert(to_destroy, task_key)
 		end
-    end
+	end
 
 	for _, key in ipairs(to_destroy) do
-        local job = self._task_map[key].job
+		local job = self._task_map[key].job
 		job:shutdown()
-        job:shutdown()
-        self.workers[job.worker_id] = self:_new_worker(job.take_tube)
+		job:shutdown()
+		self.workers[job.worker_id] = self:_new_worker(job.take_tube)
 		log.error("shutdown %s", job)
-    end
+	end
 
 	for _, key in ipairs(to_destroy) do
-        local task = self._task_map[key].task
-        task = task:fetch()
+		local task = self._task_map[key].task
+		task = task:fetch()
 		if task.status == 'T' then
 			local ok, err = pcall(function() task:backoff("qmon: autobackoff") end)
 			if not ok then
@@ -186,16 +186,16 @@ function M:_check_workers(_)
 			end
 		end
 		self._task_map[key] = nil
-    end
+	end
 	log.info("qmon exec finished, restarted: %d", #to_destroy)
 end
 
 ---@return Task[]
 function M:top(status, n)
-    return self.q.index.xq
-        :pairs({ status })
+	return self.q.index.xq
+		:pairs({ status })
 		:take(n or 5)
-        :map(function(t) return self:task(t) end)
+		:map(function(t) return self:task(t) end)
 		:totable()
 end
 
@@ -203,7 +203,7 @@ end
 ---@param key any
 ---@return Task?
 function M:get(key)
-    local t = self.q:get(key)
+	local t = self.q:get(key)
 	if not t then return end
 	return self:task(t)
 end
@@ -213,11 +213,11 @@ end
 ---@return Task
 function M:task(t)
 	assert(t, "task is not given")
-    if type(t) == 'cdata' then
-        local tbl = t:tomap({ names_only = true })
+	if type(t) == 'cdata' then
+		local tbl = t:tomap({ names_only = true })
 		tbl._queue = self
-        return Task(tbl)
-    end
+		return Task(tbl)
+	end
 
 	t._queue = self
 	return Task(t)
@@ -242,22 +242,22 @@ end
 ---@return Task?
 function M:take(options)
 	assert(tonumber(options.timeout), "timeout must be given")
-    local tuple = self.q:take(options)
-    if not tuple then return end
+	local tuple = self.q:take(options)
+	if not tuple then return end
 	local task = self:task(tuple)
 
 	local on_take_hook = self._on[task.kind]
 
-    if on_take_hook then
-        local ret = on_take_hook(task)
-        if ret == false then
-            task = task:fetch()
-            if task.status == 'T' then
+	if on_take_hook then
+		local ret = on_take_hook(task)
+		if ret == false then
+			task = task:fetch()
+			if task.status == 'T' then
 				log.warn("Task %s wasnt released after on_take_hook returned false", task)
 				return task:backoff("autobackoff: on_take_hook did not release task")
 			end
 			return
-        end
+		end
 		return ret or task
 	end
 
@@ -280,29 +280,29 @@ function M:_new_worker(take_tube)
 end
 
 function M:spawn(n, take_tube)
-    self.workers = self.workers or {}
+	self.workers = self.workers or {}
 
-    for _ = 1, n or 1 do
-        local job = self:_new_worker(take_tube)
-        job.worker_id = #self.workers + 1
+	for _ = 1, n or 1 do
+		local job = self:_new_worker(take_tube)
+		job.worker_id = #self.workers + 1
 		self.workers[job.worker_id] = job
 	end
 end
 
 function M:despawn(n, tube)
 	if tube then
-        local tube_workers = {}
+		local tube_workers = {}
 		for _, w in pairs(self.workers) do
 			if w and w.take_tube == tube then
 				table.insert(tube_workers, w)
 			end
-        end
+		end
 		for i = 1, math.min(n or 1, #tube_workers) do
-            local w = tube_workers[i]
-            w:shutdown()
+			local w = tube_workers[i]
+			w:shutdown()
 			self.workers[w.worker_id] = nil
-        end
-    else
+		end
+	else
 		local limit = n or 1
 		for _, w in pairs(self.workers) do
 			if limit == 0 then break end
@@ -311,7 +311,7 @@ function M:despawn(n, tube)
 			self.workers[w.worker_id] = nil
 			w:shutdown()
 		end
-    end
+	end
 
 	-- Rebuild self.workers (remove empty slots)
 	local max_id = 0
@@ -319,11 +319,11 @@ function M:despawn(n, tube)
 		if max_id < id then max_id = id end
 	end
 
-    local new_workers = {}
+	local new_workers = {}
 	for _, worker in pairs(self.workers) do
-        new_workers[#new_workers + 1] = worker
+		new_workers[#new_workers + 1] = worker
 		worker.worker_id = #new_workers
-    end
+	end
 
 	self.workers = new_workers
 end
@@ -331,39 +331,39 @@ end
 ---Main executor
 ---@param job any
 function M:executor_f(job)
-    local task = self:take({ timeout = self.opts.take_timeout or 1, tube = job.take_tube })
-    if not task then return end
+	local task = self:take({ timeout = self.opts.take_timeout or 1, tube = job.take_tube })
+	if not task then return end
 	-- log.warn("Staring processing task %s", task)
-    job.task = task
+	job.task = task
 
 	local key = tostring(task.id)
 	self._task_map[key] = { job = job, task = task, taken_at = fiber.time() }
 
 	local handler = self.handlers[task.kind]
 
-    if not handler then
+	if not handler then
 		self._task_map[key] = nil
 		log.warn("Handler for %s not found", task.kind)
-        task:backoff(("handler for %s not found"):format(task.kind))
+		task:backoff(("handler for %s not found"):format(task.kind))
 		return
-    end
+	end
 
-    local ok, err = xpcall(handler, traceback, task)
-    self._task_map[key] = nil
+	local ok, err = xpcall(handler, traceback, task)
+	self._task_map[key] = nil
 	job.task = nil
 
-    if not ok then
-        self:on_fail(err)
+	if not ok then
+		self:on_fail(err)
 
 		local exists = self:get({task.id})
 		if exists and exists.status == "T" then
 			task:backoff(("handler did not release task: %s"):format(err))
 			return
 		end
-    end
+	end
 
 	local exists = self:get({task.id})
-    if exists and exists.status == "T" then
+	if exists and exists.status == "T" then
 		task:backoff("handler did not release task")
 		return
 	end
@@ -385,29 +385,29 @@ end
 ---@param options QueuePutOptions
 ---@return Task, string? reason
 function M:put(task, options)
-    options = options or {}
+	options = options or {}
 
 	---@type table<xqStatus, number>
-    local skip_in_status = fun.zip(options.skip_if_status or {}, fun.ones()):tomap()
+	local skip_in_status = fun.zip(options.skip_if_status or {}, fun.ones()):tomap()
 
 	if task.dedup == nil or task.kind == nil or task.payload == nil then
-        box.error({ reason = "Fields {dedup, kind, payload} must be given" })
-    end
+		box.error({ reason = "Fields {dedup, kind, payload} must be given" })
+	end
 
-    task.attempt = 0
-    task.payload = setmetatable(task.payload, { __serialize = 'map' })
-    task.result = setmetatable(task.result or {}, { __serialize = 'map' })
-    task.error = setmetatable(task.error or {}, { __serialize = 'map' })
-    task.nice = tonumber(task.nice) or 512
+	task.attempt = 0
+	task.payload = setmetatable(task.payload, { __serialize = 'map' })
+	task.result = setmetatable(task.result or {}, { __serialize = 'map' })
+	task.error = setmetatable(task.error or {}, { __serialize = 'map' })
+	task.nice = tonumber(task.nice) or 512
 	task.tube = task.tube or 'default'
 
-    local tuple = self.q.index.dedup_kind:get({ task.dedup, task.kind })
-    if not tuple then
-        local ret = self.q:put(task, { delay = options.delay, wait = options.wait })
+	local tuple = self.q.index.dedup_kind:get({ task.dedup, task.kind })
+	if not tuple then
+		local ret = self.q:put(task, { delay = options.delay, wait = options.wait })
 		return self:task(ret)
 	end
 
-    local exists = assert(self:task(tuple))
+	local exists = assert(self:task(tuple))
 
 	if options.skip_if_exists then
 		return exists
@@ -419,14 +419,14 @@ function M:put(task, options)
 
 	if options.restart_if_exists then
 		if exists.status ~= "R" and exists.status ~= "T" then
-            return self:task(self.q:update({ exists.id }, {
-                { '=', 'status', 'R' },
-                { '=', 'attempt', 0 },
+			return self:task(self.q:update({ exists.id }, {
+				{ '=', 'status', 'R' },
+				{ '=', 'attempt', 0 },
 				{ '=', 'runat',   0 },
 			}))
-        end
+		end
 		return exists
-    end
+	end
 
 	error(("Task already exists %s"):format(tuple))
 end
@@ -435,16 +435,16 @@ end
 ---@param key any
 ---@return Task? task # returns task if found
 function M:restart(key)
-    local task = self:get(key)
+	local task = self:get(key)
 	if not task then
 		return
-    end
+	end
 	if task.status == "R" or task.status == "T" then
 		return task
 	end
-    return self:task(self.q:update({ task.id }, {
+	return self:task(self.q:update({ task.id }, {
 		{ '=', 'status', 'R' },
-        { '=', 'attempt', 0 },
+		{ '=', 'attempt', 0 },
 		{ '=', 'runat',   0 },
 	}))
 end
@@ -457,12 +457,12 @@ function M:backoff(task, reason)
 	if task.attempt+1 > self.opts.backoff.max_attempt then
 		return self:bury(task, ("Max Attempt Reached. last: %s"):format(reason or 'unknown reason'))
 	end
-    return self:task(self.q:release({ task.id }, {
-        update = {
-            { '+', 'attempt', 1 },
-            { '=', 'mtime', fiber.time() },
+	return self:task(self.q:release({ task.id }, {
+		update = {
+			{ '+', 'attempt', 1 },
+			{ '=', 'mtime', fiber.time() },
 			{ '=', 'error', { reason = reason or 'Unknown reason', last_error = fiber.time() } },
-        },
+		},
 		delay = math.min(self.opts.backoff.max_delay, self.opts.backoff.delay_base^task.attempt),
 	}))
 end
@@ -481,20 +481,20 @@ end
 ---@param opts? { delay: number?, keep: boolean? } acknowledge options
 ---@return Task
 function M:ack(task, result, opts)
-    opts = opts or {}
-    opts.update = opts.update or {}
+	opts = opts or {}
+	opts.update = opts.update or {}
 
-    local update = {
+	local update = {
 		{ '+', 'attempt', 1 },
 		{ '=', 'mtime', fiber.time() },
 		{ '=', 'result', setmetatable(result or {}, {__serialize='map'}) },
 	}
 	for key, value in pairs(opts.update) do
 		table.insert(update, { '=', key, value })
-    end
+	end
 
-    return self:task(self.q:ack({ task.id }, {
-        update = update,
+	return self:task(self.q:ack({ task.id }, {
+		update = update,
 		delay = opts.delay,
 		keep = opts.keep,
 	}))
@@ -507,13 +507,13 @@ end
 ---@return Task
 function M:bury(task, reason)
 	log.warn("Bury %s %s", task, reason)
-    self.q:bury({ task.id }, {
-        update = {
-            { '+', 'attempt', 1 },
-            { '=', 'mtime', fiber.time() },
+	self.q:bury({ task.id }, {
+		update = {
+			{ '+', 'attempt', 1 },
+			{ '=', 'mtime', fiber.time() },
 			{ '=', 'error', { reason = reason or 'Unknown reason', last_error = fiber.time() } },
-        },
-    })
+		},
+	})
 	return task:fetch()
 end
 

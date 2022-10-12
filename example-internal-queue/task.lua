@@ -27,7 +27,7 @@ end
 ---@param opts { delay: number?, reason: string? } options of release
 ---@return Task
 function M:release(reason, opts)
-    opts = opts or {}
+	opts = opts or {}
 	opts.reason = reason
 	return self._queue:release(self, opts)
 end
