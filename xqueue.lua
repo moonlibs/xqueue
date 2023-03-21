@@ -428,16 +428,6 @@ function M.upgrade(space,opts,depth)
 	self.fields = fields
 	self.fieldmap = fieldmap
 
-	if not self._stat then
-		self._stat = {
-			counts = {};
-			transition = {};
-		}
-		for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
-			local s = t[self.fields.status]
-			self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
-		end
-	end
 
 	function self:getkey(arg)
 		local _type = type(arg)
@@ -547,7 +537,43 @@ function M.upgrade(space,opts,depth)
 	end
 	self.have_runat = have_runat
 
+	---@type table<string, { counts: {}, transition: {} }>
+	local stat_tube = {}
+	if self.fields.tube and type(opts.tube_stats) == 'table' then
+		for _, tube_name in ipairs(opts.tube_stats) do
+			if type(tube_name) == 'string' then
+				stat_tube[tube_name] = {
+					counts = {},
+					transition = {},
+				}
+			end
+		end
+	end
 
+	if not self._stat then
+		self._stat = {
+			counts = {};
+			transition = {};
+			tube = stat_tube;
+		}
+		-- TODO: benchmark index:count()
+		if self.fields.tube then
+			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
+				local s = t[self.fields.status]
+				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
+
+				local tube = t[self.fields.tube]
+				if stat_tube[tube] then
+					stat_tube[tube].counts[s] = (stat_tube[tube].counts[s] or 0LL) + 1
+				end
+			end
+		else
+			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
+				local s = t[self.fields.status]
+				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
+			end
+		end
+	end
 
 	-- 3. features check
 
@@ -971,9 +997,13 @@ function M.upgrade(space,opts,depth)
 	-- because raising error earlier leads to trigger inconsistency
 	self._on_repl = space:on_replace(function(old, new)
 		local old_st, new_st
+		local old_tube, new_tube
+		local old_tube_stat, new_tube_stat
 		local counts = self._stat.counts
+		local tube_ss = self._stat.tube
+
 		if old then
-			old_st = old[self.fields.status]
+			old_st = old[self.fields.status] --[[@as string]]
 			if counts[old_st] and counts[old_st] > 0 then
 				counts[old_st] = counts[old_st] - 1
 			else
@@ -982,15 +1012,47 @@ function M.upgrade(space,opts,depth)
 					old_st, tostring(counts[old_st])
 				)
 			end
+			if self.fields.tube then
+				old_tube = old[self.fields.tube]
+				old_tube_stat = tube_ss[old_tube]
+				if type(old_tube_stat) == 'table' and type(old_tube_stat.counts) == 'table' then
+					if (tonumber(old_tube_stat.counts[old_st]) or 0) > 0 then
+						old_tube_stat.counts[old_st] = old_tube_stat.counts[old_st] - 1
+					else
+						log.error(
+							"Have not valid statistic by tubs/status: tube %s with value: %s",
+							old_tube, old_st, tostring(tube_ss[old_tube].counts[old_st])
+						)
+					end
+				else
+					old_tube_stat = nil
+				end
+			end
 		else
 			old_st = 'X'
 		end
 
 		if new then
-			new_st = new[self.fields.status]
+			new_st = new[self.fields.status] --[[@as string]]
 			counts[new_st] = (counts[new_st] or 0LL) + 1
 			if counts[new_st] < 0 then
 				log.error("Statistic overflow by task type: %s", new_st)
+			end
+			if self.fields.tube then
+				new_tube = new[self.fields.tube]
+				new_tube_stat = tube_ss[new_tube]
+				if type(new_tube_stat) == 'table' and type(new_tube_stat.counts) == 'table' then
+					if (tonumber(new_tube_stat.counts[new_st]) or 0) >= 0 then
+						new_tube_stat.counts[new_st] = (new_tube_stat.counts[new_st] or 0ULL) + 1
+					else
+						log.error(
+							"Have not valid statistic tube/status: tube %q with value: %s",
+							new_tube, new_st, tostring(new_tube_stat.counts[new_st])
+						)
+					end
+				else
+					new_tube_stat = nil
+				end
 			end
 		else
 			new_st = 'X'
@@ -998,6 +1060,23 @@ function M.upgrade(space,opts,depth)
 
 		local field = old_st.."-"..new_st
 		self._stat.transition[field] = (self._stat.transition[field] or 0ULL) + 1
+		if old_tube_stat then
+			if not new_tube_stat or old_tube_stat == new_tube_stat then
+				-- no new tube or new and old tubes are the same
+				old_tube_stat.transition[field] = (old_tube_stat.transition[field] or 0ULL) + 1
+			else
+				-- nil != old_tube != new_tube != nil
+				-- cross tube transition ?
+				-- Can this be backoff with tube change?
+				local old_field = old_st.."-S"
+				local new_field = "S-"..new_st
+				old_tube_stat.transition[old_field] = (old_tube_stat.transition[old_field] or 0ULL) + 1
+				new_tube_stat.transition[new_field] = (new_tube_stat.transition[new_field] or 0ULL) + 1
+			end
+		elseif new_tube_stat then
+			-- old_tube_stat == nil
+			new_tube_stat.transition[field] = (new_tube_stat.transition[field] or 0ULL) + 1
+		end
 	end, self._on_repl)
 
 	self._on_dis = box.session.on_disconnect(function()
@@ -1600,8 +1679,15 @@ function methods:stats(pretty)
 			if pretty then
 				stats.counts[ps] = stats.counts[s] or 0LL
 				stats.counts[s]  = nil
+				for _, tube_stat in pairs(stats.tube) do
+					tube_stat.counts[ps] = tube_stat.counts[s] or 0ULL
+					tube_stat.counts[s] = nil
+				end
 			else
 				stats.counts[s] = stats.counts[s] or 0LL
+				for _, tube_stat in pairs(stats.tube) do
+					tube_stat.counts[s] = tube_stat.counts[s] or 0ULL
+				end
 			end
 		end
 	return stats

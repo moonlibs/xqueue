@@ -78,6 +78,8 @@ M.upgrade(space, {
 			-- Time To Release. Task is returned into [R]eady unless processed (turned to ack|release from taken) within time
 			-- if number, then with default ttl, otherwise only if set during take
 	},
+	-- Set tubes for which statistics collector will be enabled
+	tube_stats = { 'tube-1', 'tube-2' },
 })
 ```
 
