@@ -1,0 +1,17 @@
+name: Linting with luacheck
+
+on:
+  - push
+  - pull_request
+
+jobs:
+  run-luacheck-linter:
+   runs-on: ubuntu-latest
+   steps:
+    - uses: actions/checkout@v3
+    - uses: tarantool/setup-tarantool@v2
+      with:
+        tarantool-version: '2.10.4'
+
+    - name: install tarantool/luacheck and execute it
+      run: tarantoolctl rocks install luacheck && .rocks/bin/luacheck .
