@@ -158,10 +158,6 @@ sp:kick(N | id, [attr]) -- put buried task id or N oldest buried tasks to [R]ead
 
 local json = require 'json'
 json.cfg{ encode_invalid_as_nil = true }
-local yaml = require 'yaml'
-local function dd(x)
-	print(yaml.encode(x))
-end
 
 
 local function typeeq(src, ref)
@@ -447,7 +443,7 @@ function M.upgrade(space,opts,depth)
 		end
 	end
 
-	function self:packkey(key)
+	function self.packkey(_, key)
 		if type(key) == 'cdata' then
 			return tostring(ffi.cast("uint64_t", key))
 		else
@@ -731,10 +727,10 @@ function M.upgrade(space,opts,depth)
 	-- self.NEVER = -1ULL
 	self.NEVER = 0
 
-	function self:keyfield(t)
+	function self.keyfield(_,t)
 		return t[pkf.no]
 	end
-	function self:keypack(t)
+	function self.keypack(_,t)
 		return t[pkf.no]
 	end
 
@@ -789,7 +785,7 @@ function M.upgrade(space,opts,depth)
 	if opts.worker then
 		local workers = opts.workers or 1
 		local worker = opts.worker
-		for i = 1,workers do
+		for id = 1,workers do
 			fiber.create(function(space,xq,i)
 				local fname = space.name .. '.xq.wrk' .. tostring(i)
 				if package.reload then fname = fname .. '.' .. package.reload.count end
@@ -821,7 +817,7 @@ function M.upgrade(space,opts,depth)
 					fiber.yield()
 				end
 				log.info("worker %s ended", i)
-			end,space,self,i)
+			end,space,self,id)
 		end
 	end
 
@@ -1059,23 +1055,23 @@ function M.upgrade(space,opts,depth)
 		end
 
 		local field = old_st.."-"..new_st
-		self._stat.transition[field] = (self._stat.transition[field] or 0ULL) + 1
+		self._stat.transition[field] = (self._stat.transition[field] or 0LL) + 1
 		if old_tube_stat then
 			if not new_tube_stat or old_tube_stat == new_tube_stat then
 				-- no new tube or new and old tubes are the same
-				old_tube_stat.transition[field] = (old_tube_stat.transition[field] or 0ULL) + 1
+				old_tube_stat.transition[field] = (old_tube_stat.transition[field] or 0LL) + 1
 			else
 				-- nil != old_tube != new_tube != nil
 				-- cross tube transition ?
 				-- Can this be backoff with tube change?
 				local old_field = old_st.."-S"
 				local new_field = "S-"..new_st
-				old_tube_stat.transition[old_field] = (old_tube_stat.transition[old_field] or 0ULL) + 1
-				new_tube_stat.transition[new_field] = (new_tube_stat.transition[new_field] or 0ULL) + 1
+				old_tube_stat.transition[old_field] = (old_tube_stat.transition[old_field] or 0LL) + 1
+				new_tube_stat.transition[new_field] = (new_tube_stat.transition[new_field] or 0LL) + 1
 			end
 		elseif new_tube_stat then
 			-- old_tube_stat == nil
-			new_tube_stat.transition[field] = (new_tube_stat.transition[field] or 0ULL) + 1
+			new_tube_stat.transition[field] = (new_tube_stat.transition[field] or 0LL) + 1
 		end
 	end, self._on_repl)
 
@@ -1680,13 +1676,13 @@ function methods:stats(pretty)
 				stats.counts[ps] = stats.counts[s] or 0LL
 				stats.counts[s]  = nil
 				for _, tube_stat in pairs(stats.tube) do
-					tube_stat.counts[ps] = tube_stat.counts[s] or 0ULL
+					tube_stat.counts[ps] = tube_stat.counts[s] or 0LL
 					tube_stat.counts[s] = nil
 				end
 			else
 				stats.counts[s] = stats.counts[s] or 0LL
 				for _, tube_stat in pairs(stats.tube) do
-					tube_stat.counts[s] = tube_stat.counts[s] or 0ULL
+					tube_stat.counts[s] = tube_stat.counts[s] or 0LL
 				end
 			end
 		end
