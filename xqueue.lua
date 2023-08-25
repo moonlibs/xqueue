@@ -694,7 +694,8 @@ function M.upgrade(space,opts,depth)
 	self.space = space.id
 
 	function self.timeoffset(delta)
-		return clock.realtime() + tonumber(delta)
+		delta = tonumber(delta) or 0
+		return clock.realtime() + delta
 	end
 	function self.timeready(time)
 		return time < clock.realtime()
