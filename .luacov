@@ -1,0 +1,20 @@
+deletestats = false
+runreport = false
+
+exclude = {
+	"test/",
+	"%.rocks/",
+	"builtin/",
+	"example",
+}
+
+runreport = false
+deletestats = false
+
+coveralls = {
+	root = "/",
+	debug = true,
+	pathcorrect = {
+		{ "^/home/runner/work/xqueue/xqueue/", "" },
+	},
+}
