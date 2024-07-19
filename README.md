@@ -50,7 +50,7 @@ M.upgrade(space, {
 		-- id is always taken from pk
 		status   = 'status_field_name'    | status_field_no,
 		runat    = 'runat_field_name'     | runat_field_no,
-		proirity = 'proirity_field_name'  | proirity_field_no,
+		priority = 'priority_field_name'  | priority_field_no,
 	},
 	features = {
 		id = 'auto_increment' | 'time64' | 'uuid' | 'required' | function

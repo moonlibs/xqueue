@@ -219,7 +219,16 @@ local function _table2tuple ( qformat )
 	return dostring(fun)
 end
 
----@type xqueueSpace
+---@alias xqStatus
+---| "R" Ready
+---| "T" Taken
+---| "W" Waiting
+---| "B" Buried
+---| "Z" Zombie
+---| "D" Done
+
+---@class xqueueSpace: boxSpaceObject
+---@field xq xq xqueue specific storage
 local methods = {}
 
 ---@class PrimaryKeyField:table
@@ -275,9 +284,6 @@ local methods = {}
 ---@field _on_repl replaceTrigger
 ---@field _on_dis fun()
 
-
----@class xqueueSpace: boxSpaceObject
----@field xq xq xqueue specific storage
 
 ---Upgrades given space to xqueue instance
 ---@param space xqueueSpace
@@ -761,11 +767,33 @@ function M.upgrade(space,opts,depth)
 
 	self.ready = fiber.channel(0)
 
+	local function rw_fiber_f(func, ...)
+		local xq = self
+		repeat
+			if box.info.ro then
+				log.verbose("awaiting rw")
+				repeat
+					if box.ctl.wait_rw then
+						box.ctl.wait_rw(1)
+					else
+						fiber.sleep(0.001)
+					end
+				until not box.info.ro
+			end
+
+			local ok, err = pcall(func, ...)
+			if not ok then
+				log.error("%s", err)
+			end
+			fiber.testcancel()
+		until (not box.space[space.name]) or space.xq ~= xq
+	end
+
 	if opts.worker then
 		local workers = opts.workers or 1
 		local worker = opts.worker
 		for i = 1,workers do
-			fiber.create(function(space,xq,i)
+			fiber.create(rw_fiber_f, function(space,xq)
 				local fname = space.name .. '.xq.wrk' .. tostring(i)
 				if package.reload then fname = fname .. '.' .. package.reload.count end
 				fiber.name(string.sub(fname,1,32))
@@ -773,7 +801,7 @@ function M.upgrade(space,opts,depth)
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
 				if box.info.ro then
-					log.notice("Shutting down on ro instance")
+					log.info("Shutting down on ro instance")
 					return
 				end
 				while box.space[space.name] and space.xq == xq do
@@ -796,13 +824,13 @@ function M.upgrade(space,opts,depth)
 					fiber.yield()
 				end
 				log.info("worker %s ended", i)
-			end,space,self,i)
+			end,space,self)
 		end
 	end
 
 	if have_runat then
 		self.runat_chan = fiber.channel(0)
-		self.runat = fiber.create(function(space,xq,runat_index)
+		self.runat = fiber.create(rw_fiber_f, function(space,xq,runat_index)
 			local fname = space.name .. '.xq'
 			if package.reload then fname = fname .. '.' .. package.reload.count end
 			fiber.name(string.sub(fname,1,32))
@@ -811,7 +839,7 @@ function M.upgrade(space,opts,depth)
 			local chan = xq.runat_chan
 			log.info("Runat started")
 			if box.info.ro then
-				log.notice("Shutting down on ro instance")
+				log.info("Shutting down on ro instance")
 				return
 			end
 			local maxrun = 1000
@@ -1110,6 +1138,10 @@ box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5; ttl = 100 })
 ```
 ]]
 
+---Puts new task into queue
+---@param t table|box.tuple
+---@param opts { delay: number?, ttl: number?, wait: number? }
+---@return table|box.tuple, boolean is_processed?
 function methods:put(t, opts)
 	local xq = self.xq
 	opts = opts or {}
@@ -1208,6 +1240,11 @@ local wait_for = {
 	W = true,
 }
 
+---Waits for task to be processed for given timeout
+---@param key any
+---@param timeout number
+---@return table|box.tuple task
+---@return boolean is_processed
 function methods:wait(key, timeout)
 	local xq = self.xq
 	key = xq:getkey(key)
@@ -1250,6 +1287,11 @@ end
 	- *TODO*: ttr must be there
 ]]
 
+---Takes task from the queue (main consumer's method)
+---This method prefered to be called as queue:take{ timeout = ..., tube = ... }
+---@param timeout number|{timeout: number?, tube: string?, ttr: number?}
+---@param opts? {timeout: number?, tube: string?, ttr: number?}
+---@return table|box.tuple? task method returns task to be processed or void
 function methods:take(timeout, opts)
 	local xq = self.xq
 	timeout = timeout or 0
@@ -1371,7 +1413,12 @@ end
 			* if set, task will become `W` instead of `R` for `delay` seconds
 ]]
 
-
+---Puts back into queue (consumer method).
+---
+---Task will be trasfered to status R (if not delay was passed) or W (if delay was passed).
+---@param key any task or key of the task (i.e ID)
+---@param attr? { delay: number?, ttl: number?, update: update_operation[]? } attributes of release
+---@return box.tuple
 function methods:release(key, attr)
 	local xq = self.xq
 	key = xq:getkey(key)
@@ -1429,6 +1476,13 @@ function methods:release(key, attr)
 	return t
 end
 
+---Acknowledges task processing.
+---
+---if delay is given task will be transfered to Zombie status for `delay` seconds (Zombie must be enabled).
+---if keep is given task will be saved into space in status Done.
+---@param key any task or key of the task (i.e ID)
+---@param attr? { delay: number?, keep: boolean?, update: update_operation[]? } attributes of ack
+---@return box.tuple
 function methods:ack(key, attr)
 	-- features.zombie
 	-- features.keep
@@ -1488,6 +1542,12 @@ function methods:ack(key, attr)
 	return t
 end
 
+---Buries task. Consumer's method aimed to save failed tasks inside queue.
+---Tasks from `Bury` status will not be given to consumer again.
+---
+---It is a good practice to save reason of failure into tuple and timestamp of operation for future investigation.
+---@param key any task or key of the task (i.e ID)
+---@param attr { update: update_operation[]? } attributes of bury
 function methods:bury(key, attr)
 	attr = attr or {}
 
@@ -1595,6 +1655,9 @@ local pretty_st = {
 	D = "Done",
 }
 
+---Reports queue statistics
+---@param pretty? any
+---@return { counts: table, transition: table }
 function methods:stats(pretty)
 	local stats = table.deepcopy(self.xq._stat)
 		for s, ps in pairs(pretty_st) do
