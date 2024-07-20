@@ -1,5 +1,4 @@
 ---@diagnostic disable: inject-field
-local fiber = require 'fiber'
 local xqueue = require 'xqueue'
 require 'test.setup'
 
