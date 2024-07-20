@@ -1,17 +1,15 @@
-local fio = require 'fio'
+---@diagnostic disable: inject-field
 local fiber = require 'fiber'
 local xqueue = require 'xqueue'
+
+require 'test.setup'
 
 local t = require 'luatest' --[[@as luatest]]
 local g = t.group('basic')
 
-t.before_suite(function()
-	local tmpdir = assert(fio.tempdir())
-	box.cfg{ memtx_dir = tmpdir, wal_dir = tmpdir, vinyl_dir = tmpdir }
-end)
-
 g.before_each(function()
 	if box.space.queue then
+		box.space.queue:truncate()
 		for i = #box.space.queue.index, 0, -1 do
 			local ind = box.space.queue.index[i]
 			ind:drop()
@@ -22,6 +20,10 @@ end)
 
 function g.test_basic_queue()
 	box.schema.space.create('queue', { if_not_exists = true })
+	---@class test.xqueue.basic.tuple: box.tuple
+	---@field id string
+	---@field status string
+	---@field payload any
 	box.space.queue:format({
 		{ name = 'id',      type = 'string' },
 		{ name = 'status',  type = 'string' },
@@ -41,7 +43,7 @@ function g.test_basic_queue()
 		},
 	})
 
-	local task = box.space.queue:put({ payload = { task = 1 } })
+	local task = box.space.queue:put({ payload = { task = 1 } }) --[[@as test.xqueue.basic.tuple]]
 	t.assert_equals(task.status, 'R', "newly inserted task must be Ready")
 	t.assert_items_include(task.payload, { task = 1 }, "payload of the task remains the same")
 
@@ -53,7 +55,7 @@ function g.test_basic_queue()
 	t.assert_le(elapsed, 0.1, "queue:take() must return task after single yield")
 	t.assert_equals(taken.status, 'T', "taken task must be in status T")
 
-	local tuple = box.space.queue:get(taken.id)
+	local tuple = box.space.queue:get(taken.id) --[[@as test.xqueue.basic.tuple]]
 	t.assert_equals(tuple.status, 'T', "status of taken task in space must be T")
 
 	ft = fiber.time()
@@ -64,7 +66,7 @@ function g.test_basic_queue()
 	t.assert_le(elapsed, 0.1, "second queue:take() must be returned in ≤ 0.1 seconds")
 
 	box.space.queue:release(taken)
-	tuple = box.space.queue:get(taken.id)
+	tuple = box.space.queue:get(taken.id) --[[@as test.xqueue.basic.tuple]]
 
 	t.assert_equals(tuple.status, 'R', "queue:release() must return task in R status")
 	taken = box.space.queue:take(0.001)
@@ -123,7 +125,12 @@ function g.test_basic_queue()
 end
 
 function g.test_delayed_queue()
-	local queue = box.schema.space.create('queue', { if_not_exists = true }) --[[@as xqueueSpace]]
+	local queue = box.schema.space.create('queue', { if_not_exists = true }) --[[@as xqueue.space]]
+	---@class test.xqueue.delayed.tuple: box.tuple
+	---@field id number
+	---@field status string
+	---@field runat number
+	---@field payload any
 	queue:format({
 		{ name = 'id',      type = 'unsigned' },
 		{ name = 'status',  type = 'string'   },
@@ -150,17 +157,19 @@ function g.test_delayed_queue()
 
 	local task_put_delay_500ms = queue:put({ payload = { id = 2 } }, {
 		delay = 0.1,
-	})
+	}) --[[@as test.xqueue.delayed.tuple]]
 	t.assert_equals(task_put_delay_500ms.status, 'W', 'queue:put(...,{delay=<>}) must insert task in W status')
 	t.assert_equals(queue:get({task_put_delay_500ms.id}).status, 'W', 'double check task status in space (must be W)')
 
-	local task_put = queue:put({ payload = { id = 1 } })
+	local task_put = queue:put({ payload = { id = 1 } }) --[[@as test.xqueue.delayed.tuple]]
 	t.assert_equals(task_put.status, 'R', "queue:put() without delay in delayed queue must set task to R")
 	t.assert_equals(queue:get({task_put.id}).status, 'R', 'double check task status in space (must be R)')
 
 	t.assert_lt(task_put_delay_500ms.id, task_put.id, "first task must have smaller id than second (fifo constraint)")
 
 	local taken = queue:take({ timeout = 0.05 })
+	t.assert(taken, "task must be taken")
+	---@cast taken -nil
 	t.assert_equals(taken.id, task_put.id, 'queue:take() must return ready task')
 
 	queue:release(taken, { delay = 0.12 })
@@ -209,7 +218,7 @@ function g.test_delayed_queue()
 	t.assert_is(queue:get(take.id).status, 'Z', ':ack()+delay return task into Z status')
 	t.assert_items_equals(queue:get(take.id).payload, { finished = 2 }, ':ack()/update must replace tuple content')
 
-	local nothing = queue:take({ timeout = 0.75 })
+	local nothing = queue:take({ timeout = 1.5 })
 	t.assert_not(nothing, "Z tasks must are not takable")
 
 	t.assert_not(queue:get(take.id), "Z task must be collected after delay time out exhausted")

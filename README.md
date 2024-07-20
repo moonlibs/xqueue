@@ -1,4 +1,5 @@
 ### TODO
+
 * reload/upgrade and feature switch
 * composite primary keys
 * switch - turn non-taken task into any state
@@ -35,7 +36,7 @@
 
 # Interface
 
-## Creator methods:
+## Creator methods
 
 * `.upgrade(space, options)`
 
@@ -83,7 +84,7 @@ M.upgrade(space, {
 })
 ```
 
-## Producer methods:
+## Producer methods
 
 * `space:put`
 	- `task` - table or array or tuple
@@ -146,7 +147,7 @@ box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5; ttl = 100 })
 		+ `update` - table for update, like in space:update
 		+ `ttl` - timeout for time to live (?)
 
-## Admin methods:
+## Admin methods
 
 * `space:dig(id, [attr])` - dig out task from buried state
 	- `id` - as in `:ack`

@@ -215,7 +215,7 @@ local function _table2tuple ( qformat )
 	return dostring(fun)
 end
 
----@type xqueueSpace
+---@class xqueue.space
 local methods = {}
 
 ---@class PrimaryKeyField:table
@@ -272,12 +272,41 @@ local methods = {}
 ---@field _on_dis fun()
 
 
----@class xqueueSpace: boxSpaceObject
+---@class xqueue.space: boxSpaceObject
 ---@field xq xq xqueue specific storage
 
+---@class xqueue.fields
+---@field status? string|number Xqueue name for the Status field
+---@field runat? string|number Xqueue name for the RunAt field
+---@field priority? string|number Xqueue name for Task priority field
+---@field tube? string|number Xqueue name for Tube field
+
+---@class xqueue.features
+---@field id 'uuid' | 'auto_increment' | 'required' | 'time64' | (fun(): number|string) Mandatory Field for TaskID generation
+---@field retval? 'table'|'tuple' Type of return Value of the task in xqueue methods.
+---(Default: table when space with format, tuple when space is without format)
+---@field buried? boolean should xqueue allow buring of the tasks (by default: true)
+---@field keep? boolean should xqueue keep :ack'ed tasks in the Space or not
+---@field delayed? boolean should xqueue allow delay tasks (requires runat field and index) (defauled: false)
+---@field zombie? boolean|number should xqueue temporarily keep :ack'ed tasks in the Space (default: false). Mutually exclusive with keep
+---when zombie is configured with number, then this value is treated as zombie_delay (requires runat to be present)
+---@field ttl? boolean|number should xqueue allow Time-To-Live on tasks. When specified with number, this value used for ttl_default.
+---Requires runat field and index.
+---@field ttr? boolean|number should xqueue allow Time-To-Release on tasks. When specified with number, this value used for ttl_default.
+---Requires runat field and index.
+
+---@class xqueue.upgrade.options
+---@field format? boxSpaceFormat
+---@field fields xqueue.fields
+---@field debug? boolean
+---@field tube_stats? string[] List of tube names for per-tube statistics
+---@field features xqueue.features
+---@field worker? fun(task: box.tuple|table) simple ad-hoc worker callback
+---@field workers? number (number of workers to spawn)
+
 ---Upgrades given space to xqueue instance
----@param space xqueueSpace
----@param opts table
+---@param space xqueue.space
+---@param opts xqueue.upgrade.options
 ---@param depth? number
 function M.upgrade(space,opts,depth)
 	depth = depth or 0
@@ -320,9 +349,9 @@ function M.upgrade(space,opts,depth)
 		__serialize='map',
 		__newindex = function(t, key, val)
 			if type(val) == 'table' then
-				return rawset(t, key, setmetatable(val, taken_mt))
+				rawset(t, key, setmetatable(val, taken_mt))
 			else
-				return rawset(t, key, val)
+				rawset(t, key, val)
 			end
 		end
 	})
@@ -788,6 +817,7 @@ function M.upgrade(space,opts,depth)
 		for id = 1,workers do
 			fiber.create(function(space,xq,i)
 				local fname = space.name .. '.xq.wrk' .. tostring(i)
+				---@diagnostic disable-next-line: undefined-field
 				if package.reload then fname = fname .. '.' .. package.reload.count end
 				fiber.name(string.sub(fname,1,32))
 				repeat fiber.sleep(0.001) until space.xq
@@ -1039,7 +1069,7 @@ function M.upgrade(space,opts,depth)
 				new_tube_stat = tube_ss[new_tube]
 				if type(new_tube_stat) == 'table' and type(new_tube_stat.counts) == 'table' then
 					if (tonumber(new_tube_stat.counts[new_st]) or 0) >= 0 then
-						new_tube_stat.counts[new_st] = (new_tube_stat.counts[new_st] or 0ULL) + 1
+						new_tube_stat.counts[new_st] = (new_tube_stat.counts[new_st] or 0LL) + 1
 					else
 						log.error(
 							"Have not valid statistic tube/status: tube %q with value: %s",
@@ -1184,6 +1214,9 @@ box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5; ttl = 100 })
 ```
 ]]
 
+---@param t any[]|box.tuple
+---@param opts? { delay: number?, ttl: number?, wait: number? }
+---@return table|box.tuple, boolean? has_been_processed
 function methods:put(t, opts)
 	local xq = self.xq
 	opts = opts or {}
@@ -1282,6 +1315,9 @@ local wait_for = {
 	W = true,
 }
 
+---@param key table|scalar|box.tuple
+---@param timeout number
+---@return table|box.tuple, boolean? has_been_processed
 function methods:wait(key, timeout)
 	local xq = self.xq
 	key = xq:getkey(key)
@@ -1324,6 +1360,9 @@ end
 	- *TODO*: ttr must be there
 ]]
 
+---@param timeout? number|{ timeout: number?, ttr: number?, tube: string? }
+---@param opts? { timeout: number?, ttr: number?, tube: string? }
+---@return table|box.tuple?
 function methods:take(timeout, opts)
 	local xq = self.xq
 	timeout = timeout or 0
@@ -1365,6 +1404,7 @@ function methods:take(timeout, opts)
 		index = xq.index
 		start_with = {'R'}
 	end
+	---@cast index -nil
 
 	local now = fiber.time()
 	local key
@@ -1445,7 +1485,9 @@ end
 			* if set, task will become `W` instead of `R` for `delay` seconds
 ]]
 
-
+---@param key table|scalar|box.tuple
+---@param attr? {delay: number?, ttl: number?, update: { [1]: update_operation, [2]: number|string, [3]: tuple_type }[] }
+---@return table|box.tuple
 function methods:release(key, attr)
 	local xq = self.xq
 	key = xq:getkey(key)
@@ -1503,6 +1545,9 @@ function methods:release(key, attr)
 	return t
 end
 
+---@param key table|scalar|box.tuple
+---@param attr? {delay: number?, ttl: number?, update: { [1]: update_operation, [2]: number|string, [3]: tuple_type }[] }
+---@return table|box.tuple
 function methods:ack(key, attr)
 	-- features.zombie
 	-- features.keep
@@ -1562,6 +1607,8 @@ function methods:ack(key, attr)
 	return t
 end
 
+---@param key table|scalar|box.tuple
+---@param attr? {delay: number?, ttl: number?, update: { [1]: update_operation, [2]: number|string, [3]: tuple_type }[] }
 function methods:bury(key, attr)
 	attr = attr or {}
 
@@ -1618,26 +1665,27 @@ function methods:kick(nr_tasks_or_task, attr)
 	end
 end
 
+---@param key table|scalar|box.tuple
+---@return box.tuple|table
 function methods:kill(key)
 	local xq     = self.xq
-	key    = xq:getkey(key)
+	key = xq:getkey(key)
 	local task   = self:get(key)
-	local status = task[xq.fields.status]
+	if not task then
+		error(("Task by %s not found to kill"):format(key))
+	end
 	local peer   = box.session.storage.peer
 
 	if xq.debug then
 		log.info("Kill {%s} by %s, sid=%s, fid=%s", key, peer, box.session.id(), fiber.id())
 	end
 
-	self:delete(key)
-
-	if status == 'T' then
-		for sid in pairs(xq.bysid) do
-			xq.bysid[sid][key] = nil
-		end
-		xq.taken[key] = nil
-		xq._lock[key] = nil
-	end
+	task = self:delete(key)
+	---@cast task -nil
+	---Kill is treated as a synonim of Bury
+	task = task:update({{ '=', xq.fields.status, 'B' }})
+	xq:putback(task)
+	return xq.retwrap(task)
 end
 
 -- special remap of truncate for deliting stats and saving methods
@@ -1669,6 +1717,7 @@ local pretty_st = {
 	D = "Done",
 }
 
+---@param pretty? boolean
 function methods:stats(pretty)
 	local stats = table.deepcopy(self.xq._stat)
 		for s, ps in pairs(pretty_st) do
@@ -1690,7 +1739,7 @@ function methods:stats(pretty)
 end
 
 setmetatable(M,{
-	__call = function(M, space, opts)
+	__call = function(_, space, opts)
 		M.upgrade(space,opts,1)
 	end
 })

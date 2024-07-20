@@ -1,8 +1,7 @@
-std = "luajit"
+std = "tarantool"
 codes = true
 globals = {
-	-- Tarantool variable:
-	"box",
+	-- Tarantool variables:
 	"table.deepcopy",
 	"dostring",
 
