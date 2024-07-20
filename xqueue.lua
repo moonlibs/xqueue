@@ -745,7 +745,8 @@ function M.upgrade(space,opts,depth)
 	self.space = space.id
 
 	function self.timeoffset(delta)
-		return clock.realtime() + tonumber(delta)
+		delta = tonumber(delta) or 0
+		return clock.realtime() + delta
 	end
 	function self.timeready(time)
 		return time < clock.realtime()
@@ -811,11 +812,33 @@ function M.upgrade(space,opts,depth)
 
 	self.ready = fiber.channel(0)
 
+	local function rw_fiber_f(func, ...)
+		local xq = self
+		repeat
+			if box.info.ro then
+				log.verbose("awaiting rw")
+				repeat
+					if box.ctl.wait_rw then
+						box.ctl.wait_rw(1)
+					else
+						fiber.sleep(0.001)
+					end
+				until not box.info.ro
+			end
+
+			local ok, err = pcall(func, ...)
+			if not ok then
+				log.error("%s", err)
+			end
+			fiber.testcancel()
+		until (not box.space[space.name]) or space.xq ~= xq
+	end
+
 	if opts.worker then
 		local workers = opts.workers or 1
 		local worker = opts.worker
-		for id = 1,workers do
-			fiber.create(function(space,xq,i)
+		for i = 1,workers do
+			fiber.create(rw_fiber_f, function(space,xq)
 				local fname = space.name .. '.xq.wrk' .. tostring(i)
 				---@diagnostic disable-next-line: undefined-field
 				if package.reload then fname = fname .. '.' .. package.reload.count end
@@ -824,7 +847,7 @@ function M.upgrade(space,opts,depth)
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
 				if box.info.ro then
-					log.notice("Shutting down on ro instance")
+					log.info("Shutting down on ro instance")
 					return
 				end
 				while box.space[space.name] and space.xq == xq do
@@ -847,13 +870,13 @@ function M.upgrade(space,opts,depth)
 					fiber.yield()
 				end
 				log.info("worker %s ended", i)
-			end,space,self,id)
+			end,space,self)
 		end
 	end
 
 	if have_runat then
 		self.runat_chan = fiber.channel(0)
-		self.runat = fiber.create(function(space,xq,runat_index)
+		self.runat = fiber.create(rw_fiber_f, function(space,xq,runat_index)
 			local fname = space.name .. '.xq'
 			if package.reload then fname = fname .. '.' .. package.reload.count end
 			fiber.name(string.sub(fname,1,32))
@@ -862,7 +885,7 @@ function M.upgrade(space,opts,depth)
 			local chan = xq.runat_chan
 			log.info("Runat started")
 			if box.info.ro then
-				log.notice("Shutting down on ro instance")
+				log.info("Shutting down on ro instance")
 				return
 			end
 			local maxrun = 1000
