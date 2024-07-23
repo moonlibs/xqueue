@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags')
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v4
     - uses: tarantool/setup-tarantool@v3
       with:
-        tarantool-version: '2.6'
+        tarantool-version: '2.10.6'
 
     # https://stackoverflow.com/questions/58177786/get-the-current-pushed-tag-in-github-actions
     - name: Set env
