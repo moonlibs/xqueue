@@ -1,8 +1,7 @@
-std = "luajit"
+std = "tarantool"
 codes = true
 globals = {
-	-- Tarantool variable:
-	"box",
+	-- Tarantool variables:
 	"table.deepcopy",
 	"dostring",
 
@@ -10,12 +9,14 @@ globals = {
 	"package.reload",
 }
 
+include_files = {
+	"xqueue.lua"
+}
+
+max_line_length = 140
+
 ignore = {
-	"211",
-	"212",
-	"431",
-	"432",
-	"542",
-	"611",
--- 	"631",
+	"431", -- shadowing upvalue self
+	"432", -- shadowing upvalue argument
+	"542", -- empty if branch
 }

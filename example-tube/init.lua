@@ -44,8 +44,8 @@ do
 end
 
 require 'xqueue'.upgrade(box.space.utube, {
+	format = box.space.utube:format(),
 	debug  = true,
-	format = format,
 	fields = {
 		status   = 'status',
 		runat    = 'runat',
@@ -59,6 +59,7 @@ require 'xqueue'.upgrade(box.space.utube, {
 
 		retval  = 'tuple',
 	},
+	tube_stats = {'tube', 'dead'},
 })
 
 local fiber = require 'fiber'

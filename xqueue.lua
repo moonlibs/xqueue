@@ -158,10 +158,6 @@ sp:kick(N | id, [attr]) -- put buried task id or N oldest buried tasks to [R]ead
 
 local json = require 'json'
 json.cfg{ encode_invalid_as_nil = true }
-local yaml = require 'yaml'
-local function dd(x)
-	print(yaml.encode(x))
-end
 
 
 local function typeeq(src, ref)
@@ -219,7 +215,7 @@ local function _table2tuple ( qformat )
 	return dostring(fun)
 end
 
----@type xqueueSpace
+---@class xqueue.space
 local methods = {}
 
 ---@class PrimaryKeyField:table
@@ -274,14 +270,44 @@ local methods = {}
 ---@field _default_truncate fun(space: boxSpaceObject)
 ---@field _on_repl replaceTrigger
 ---@field _on_dis fun()
+---@field ready? fiber.channel channel appears when xq is not ready
 
 
----@class xqueueSpace: boxSpaceObject
+---@class xqueue.space: boxSpaceObject
 ---@field xq xq xqueue specific storage
 
+---@class xqueue.fields
+---@field status? string|number Xqueue name for the Status field
+---@field runat? string|number Xqueue name for the RunAt field
+---@field priority? string|number Xqueue name for Task priority field
+---@field tube? string|number Xqueue name for Tube field
+
+---@class xqueue.features
+---@field id 'uuid' | 'auto_increment' | 'required' | 'time64' | (fun(): number|string) Mandatory Field for TaskID generation
+---@field retval? 'table'|'tuple' Type of return Value of the task in xqueue methods.
+---(Default: table when space with format, tuple when space is without format)
+---@field buried? boolean should xqueue allow buring of the tasks (by default: true)
+---@field keep? boolean should xqueue keep :ack'ed tasks in the Space or not
+---@field delayed? boolean should xqueue allow delay tasks (requires runat field and index) (defauled: false)
+---@field zombie? boolean|number should xqueue temporarily keep :ack'ed tasks in the Space (default: false). Mutually exclusive with keep
+---when zombie is configured with number, then this value is treated as zombie_delay (requires runat to be present)
+---@field ttl? boolean|number should xqueue allow Time-To-Live on tasks. When specified with number, this value used for ttl_default.
+---Requires runat field and index.
+---@field ttr? boolean|number should xqueue allow Time-To-Release on tasks. When specified with number, this value used for ttl_default.
+---Requires runat field and index.
+
+---@class xqueue.upgrade.options
+---@field format? boxSpaceFormat
+---@field fields xqueue.fields
+---@field debug? boolean
+---@field tube_stats? string[] List of tube names for per-tube statistics
+---@field features xqueue.features
+---@field worker? fun(task: box.tuple|table) simple ad-hoc worker callback
+---@field workers? number (number of workers to spawn)
+
 ---Upgrades given space to xqueue instance
----@param space xqueueSpace
----@param opts table
+---@param space xqueue.space
+---@param opts xqueue.upgrade.options
 ---@param depth? number
 function M.upgrade(space,opts,depth)
 	depth = depth or 0
@@ -324,9 +350,9 @@ function M.upgrade(space,opts,depth)
 		__serialize='map',
 		__newindex = function(t, key, val)
 			if type(val) == 'table' then
-				return rawset(t, key, setmetatable(val, taken_mt))
+				rawset(t, key, setmetatable(val, taken_mt))
 			else
-				return rawset(t, key, val)
+				rawset(t, key, val)
 			end
 		end
 	})
@@ -428,16 +454,6 @@ function M.upgrade(space,opts,depth)
 	self.fields = fields
 	self.fieldmap = fieldmap
 
-	if not self._stat then
-		self._stat = {
-			counts = {};
-			transition = {};
-		}
-		for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
-			local s = t[self.fields.status]
-			self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
-		end
-	end
 
 	function self:getkey(arg)
 		local _type = type(arg)
@@ -457,7 +473,7 @@ function M.upgrade(space,opts,depth)
 		end
 	end
 
-	function self:packkey(key)
+	function self.packkey(_, key)
 		if type(key) == 'cdata' then
 			return tostring(ffi.cast("uint64_t", key))
 		else
@@ -547,7 +563,44 @@ function M.upgrade(space,opts,depth)
 	end
 	self.have_runat = have_runat
 
+	---@type table<string, { counts: {}, transition: {} }>
+	local stat_tube = {}
+	if self.fields.tube and type(opts.tube_stats) == 'table' then
+		for _, tube_name in ipairs(opts.tube_stats) do
+			if type(tube_name) == 'string' then
+				stat_tube[tube_name] = {
+					counts = {},
+					transition = {},
+				}
+			end
+		end
+	end
 
+	if not self._stat then
+		self._stat = {
+			counts = {};
+			transition = {};
+			tube = stat_tube;
+		}
+		if self.fields.tube then
+			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
+				local s = t[self.fields.status]
+				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
+
+				local tube = t[self.fields.tube]
+				if stat_tube[tube] then
+					stat_tube[tube].counts[s] = (stat_tube[tube].counts[s] or 0LL) + 1
+				end
+			end
+		else
+			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
+				local s = t[self.fields.status]
+				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
+			end
+		end
+	else
+		self._stat = { counts = {}, transition = {}, tube = stat_tube }
+	end
 
 	-- 3. features check
 
@@ -706,10 +759,10 @@ function M.upgrade(space,opts,depth)
 	-- self.NEVER = -1ULL
 	self.NEVER = 0
 
-	function self:keyfield(t)
+	function self.keyfield(_,t)
 		return t[pkf.no]
 	end
-	function self:keypack(t)
+	function self.keypack(_,t)
 		return t[pkf.no]
 	end
 
@@ -761,22 +814,43 @@ function M.upgrade(space,opts,depth)
 
 	self.ready = fiber.channel(0)
 
+	local function rw_fiber_f(func, ...)
+		local xq = self
+		repeat
+			if box.info.ro then
+				log.verbose("awaiting rw")
+				repeat
+					if box.ctl.wait_rw then
+						pcall(box.ctl.wait_rw, 1)
+					else
+						fiber.sleep(0.001)
+					end
+				until not box.info.ro
+			end
+
+			local ok, err = pcall(func, ...)
+			if not ok then
+				log.error("%s%s",
+					err, xq.ready and ': (xq is not ready yet)' or '')
+			end
+			fiber.testcancel()
+		until (not box.space[space.name]) or space.xq ~= xq
+	end
+
 	if opts.worker then
 		local workers = opts.workers or 1
 		local worker = opts.worker
 		for i = 1,workers do
-			fiber.create(function(space,xq,i)
+			fiber.create(rw_fiber_f, function(space,xq)
 				local fname = space.name .. '.xq.wrk' .. tostring(i)
+				---@diagnostic disable-next-line: undefined-field
 				if package.reload then fname = fname .. '.' .. package.reload.count end
 				fiber.name(string.sub(fname,1,32))
 				repeat fiber.sleep(0.001) until space.xq
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
-				if box.info.ro then
-					log.notice("Shutting down on ro instance")
-					return
-				end
-				while box.space[space.name] and space.xq == xq do
+				while box.space[space.name] and space.xq == xq and not box.info.ro do
+					if xq.ready then xq.ready:get() end
 					local task = space:take(1)
 					if task then
 						local key = xq:getkey(task)
@@ -795,14 +869,18 @@ function M.upgrade(space,opts,depth)
 					end
 					fiber.yield()
 				end
+				if box.info.ro then
+					log.info("Shutting down on ro instance")
+					return
+				end
 				log.info("worker %s ended", i)
-			end,space,self,i)
+			end,space,self)
 		end
 	end
 
 	if have_runat then
 		self.runat_chan = fiber.channel(0)
-		self.runat = fiber.create(function(space,xq,runat_index)
+		self.runat = fiber.create(rw_fiber_f, function(space,xq,runat_index)
 			local fname = space.name .. '.xq'
 			if package.reload then fname = fname .. '.' .. package.reload.count end
 			fiber.name(string.sub(fname,1,32))
@@ -810,14 +888,10 @@ function M.upgrade(space,opts,depth)
 			if xq.ready then xq.ready:get() end
 			local chan = xq.runat_chan
 			log.info("Runat started")
-			if box.info.ro then
-				log.notice("Shutting down on ro instance")
-				return
-			end
 			local maxrun = 1000
 			local curwait
 			local collect = {}
-			while box.space[space.name] and space.xq == xq do
+			while box.space[space.name] and space.xq == xq and not box.info.ro do
 				local r,e = pcall(function()
 					-- print("runat loop 2 ",box.time64())
 					local remaining
@@ -893,6 +967,10 @@ function M.upgrade(space,opts,depth)
 				-- log.info("Wait %0.2fs",curwait)
 				if curwait == 0 then fiber.sleep(0) end
 				chan:get(curwait)
+			end
+			if box.info.ro then
+				log.info("Shutting down on ro instance")
+				return
 			end
 			log.info("Runat ended")
 		end,space,self,runat_index)
@@ -972,9 +1050,13 @@ function M.upgrade(space,opts,depth)
 	-- because raising error earlier leads to trigger inconsistency
 	self._on_repl = space:on_replace(function(old, new)
 		local old_st, new_st
+		local old_tube, new_tube
+		local old_tube_stat, new_tube_stat
 		local counts = self._stat.counts
+		local tube_ss = self._stat.tube
+
 		if old then
-			old_st = old[self.fields.status]
+			old_st = old[self.fields.status] --[[@as string]]
 			if counts[old_st] and counts[old_st] > 0 then
 				counts[old_st] = counts[old_st] - 1
 			else
@@ -983,22 +1065,71 @@ function M.upgrade(space,opts,depth)
 					old_st, tostring(counts[old_st])
 				)
 			end
+			if self.fields.tube then
+				old_tube = old[self.fields.tube]
+				old_tube_stat = tube_ss[old_tube]
+				if type(old_tube_stat) == 'table' and type(old_tube_stat.counts) == 'table' then
+					if (tonumber(old_tube_stat.counts[old_st]) or 0) > 0 then
+						old_tube_stat.counts[old_st] = old_tube_stat.counts[old_st] - 1
+					else
+						log.error(
+							"Have not valid statistic by tubs/status: tube %s with value: %s",
+							old_tube, old_st, tostring(tube_ss[old_tube].counts[old_st])
+						)
+					end
+				else
+					old_tube_stat = nil
+				end
+			end
 		else
 			old_st = 'X'
 		end
 
 		if new then
-			new_st = new[self.fields.status]
+			new_st = new[self.fields.status] --[[@as string]]
 			counts[new_st] = (counts[new_st] or 0LL) + 1
 			if counts[new_st] < 0 then
 				log.error("Statistic overflow by task type: %s", new_st)
+			end
+			if self.fields.tube then
+				new_tube = new[self.fields.tube]
+				new_tube_stat = tube_ss[new_tube]
+				if type(new_tube_stat) == 'table' and type(new_tube_stat.counts) == 'table' then
+					if (tonumber(new_tube_stat.counts[new_st]) or 0) >= 0 then
+						new_tube_stat.counts[new_st] = (new_tube_stat.counts[new_st] or 0LL) + 1
+					else
+						log.error(
+							"Have not valid statistic tube/status: tube %q with value: %s",
+							new_tube, new_st, tostring(new_tube_stat.counts[new_st])
+						)
+					end
+				else
+					new_tube_stat = nil
+				end
 			end
 		else
 			new_st = 'X'
 		end
 
 		local field = old_st.."-"..new_st
-		self._stat.transition[field] = (self._stat.transition[field] or 0ULL) + 1
+		self._stat.transition[field] = (self._stat.transition[field] or 0LL) + 1
+		if old_tube_stat then
+			if not new_tube_stat or old_tube_stat == new_tube_stat then
+				-- no new tube or new and old tubes are the same
+				old_tube_stat.transition[field] = (old_tube_stat.transition[field] or 0LL) + 1
+			else
+				-- nil != old_tube != new_tube != nil
+				-- cross tube transition ?
+				-- Can this be backoff with tube change?
+				local old_field = old_st.."-S"
+				local new_field = "S-"..new_st
+				old_tube_stat.transition[old_field] = (old_tube_stat.transition[old_field] or 0LL) + 1
+				new_tube_stat.transition[new_field] = (new_tube_stat.transition[new_field] or 0LL) + 1
+			end
+		elseif new_tube_stat then
+			-- old_tube_stat == nil
+			new_tube_stat.transition[field] = (new_tube_stat.transition[field] or 0LL) + 1
+		end
 	end, self._on_repl)
 
 	self._on_dis = box.session.on_disconnect(function()
@@ -1037,7 +1168,6 @@ function M.upgrade(space,opts,depth)
 
 	log.info("Upgraded %s into xqueue (status=%s)", space.name, box.info.status)
 
-
 	function self:starttest()
 		local xq = self
 		if box.info.status == 'orphan' then
@@ -1054,10 +1184,16 @@ function M.upgrade(space,opts,depth)
 		if box.info.ro then
 			log.info("Server is ro, not resetting statuses")
 		else
-			-- FIXME: with stable iterators add yield
 			local space = box.space[self.space]
+			local ver = tonumber(rawget(_G, '_TARANTOOL'):match('^([^.]+%.[^.]+)'))
+			local yield_limit = 2^32-1
+			local scanned = 0
+			if ver >= 1.10 then
+				yield_limit = 1000
+			end
 			box.begin()
 			for _,t in self.index:pairs({'T'},{ iterator = box.index.EQ }) do
+				scanned = scanned + 1
 				local key = t[ xq.key.no ]
 				if not self.taken[key] and not self._lock[key] then
 					local update = {
@@ -1069,6 +1205,11 @@ function M.upgrade(space,opts,depth)
 					}
 					space:update({key}, update)
 					log.info("Start: T->R (%s)", key)
+				end
+				if scanned == yield_limit then
+					scanned = 0
+					box.commit()
+					box.begin()
 				end
 			end
 			box.commit()
@@ -1110,6 +1251,9 @@ box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5; ttl = 100 })
 ```
 ]]
 
+---@param t any[]|box.tuple
+---@param opts? { delay: number?, ttl: number?, wait: number? }
+---@return table|box.tuple, boolean? has_been_processed
 function methods:put(t, opts)
 	local xq = self.xq
 	opts = opts or {}
@@ -1208,6 +1352,9 @@ local wait_for = {
 	W = true,
 }
 
+---@param key table|scalar|box.tuple
+---@param timeout number
+---@return table|box.tuple, boolean? has_been_processed
 function methods:wait(key, timeout)
 	local xq = self.xq
 	key = xq:getkey(key)
@@ -1250,6 +1397,9 @@ end
 	- *TODO*: ttr must be there
 ]]
 
+---@param timeout? number|{ timeout: number?, ttr: number?, tube: string? }
+---@param opts? { timeout: number?, ttr: number?, tube: string? }
+---@return table|box.tuple?
 function methods:take(timeout, opts)
 	local xq = self.xq
 	timeout = timeout or 0
@@ -1291,6 +1441,7 @@ function methods:take(timeout, opts)
 		index = xq.index
 		start_with = {'R'}
 	end
+	---@cast index -nil
 
 	local now = fiber.time()
 	local key
@@ -1371,7 +1522,9 @@ end
 			* if set, task will become `W` instead of `R` for `delay` seconds
 ]]
 
-
+---@param key table|scalar|box.tuple
+---@param attr? {delay: number?, ttl: number?, update: { [1]: update_operation, [2]: number|string, [3]: tuple_type }[] }
+---@return table|box.tuple
 function methods:release(key, attr)
 	local xq = self.xq
 	key = xq:getkey(key)
@@ -1429,6 +1582,9 @@ function methods:release(key, attr)
 	return t
 end
 
+---@param key table|scalar|box.tuple
+---@param attr? {delay: number?, ttl: number?, update: { [1]: update_operation, [2]: number|string, [3]: tuple_type }[] }
+---@return table|box.tuple
 function methods:ack(key, attr)
 	-- features.zombie
 	-- features.keep
@@ -1488,6 +1644,8 @@ function methods:ack(key, attr)
 	return t
 end
 
+---@param key table|scalar|box.tuple
+---@param attr? {delay: number?, ttl: number?, update: { [1]: update_operation, [2]: number|string, [3]: tuple_type }[] }
 function methods:bury(key, attr)
 	attr = attr or {}
 
@@ -1544,40 +1702,44 @@ function methods:kick(nr_tasks_or_task, attr)
 	end
 end
 
+---@param key table|scalar|box.tuple
+---@return box.tuple|table
 function methods:kill(key)
 	local xq     = self.xq
-	key    = xq:getkey(key)
+	key = xq:getkey(key)
 	local task   = self:get(key)
-	local status = task[xq.fields.status]
+	if not task then
+		error(("Task by %s not found to kill"):format(key))
+	end
 	local peer   = box.session.storage.peer
 
 	if xq.debug then
 		log.info("Kill {%s} by %s, sid=%s, fid=%s", key, peer, box.session.id(), fiber.id())
 	end
 
-	self:delete(key)
-
-	if status == 'T' then
-		for sid in pairs(xq.bysid) do
-			xq.bysid[sid][key] = nil
-		end
-		xq.taken[key] = nil
-		xq._lock[key] = nil
-	end
+	task = self:delete(key)
+	---@cast task -nil
+	---Kill is treated as a synonim of Bury
+	task = task:update({{ '=', xq.fields.status, 'B' }})
+	xq:putback(task)
+	return xq.retwrap(task)
 end
 
 -- special remap of truncate for deliting stats and saving methods
 function methods:truncate()
-	local stat = self.xq._stat
+	local xq = self.xq
+	xq.ready = xq.ready or fiber.channel(0)
+	local stat = xq._stat
 	for status, _ in pairs(stat.counts) do
 		stat.counts[status] = 0LL
 	end
 	for transition, _ in pairs(stat.transition) do
 		stat.transition[transition] = nil
 	end
-	local ret = self.xq._default_truncate(self)
+	local ret = xq._default_truncate(self)
 	local meta = debug.getmetatable(self)
 	for k,v in pairs(methods) do meta[k] = v end
+	xq:make_ready()
 	-- Now we reset our methods after truncation because
 	-- as we can see in on_replace_dd_truncate:
 	-- https://github.com/tarantool/tarantool/blob/0b7cc52607b2290d2f35cc68ee1a8243988c2735/src/box/alter.cc#L2239
@@ -1595,21 +1757,33 @@ local pretty_st = {
 	D = "Done",
 }
 
+local shortmap = { __serialize = 'map' }
+
+---@param pretty? boolean
 function methods:stats(pretty)
 	local stats = table.deepcopy(self.xq._stat)
 		for s, ps in pairs(pretty_st) do
 			if pretty then
 				stats.counts[ps] = stats.counts[s] or 0LL
 				stats.counts[s]  = nil
+				for _, tube_stat in pairs(stats.tube) do
+					tube_stat.counts[ps] = tube_stat.counts[s] or 0LL
+					tube_stat.counts[s] = nil
+				end
 			else
 				stats.counts[s] = stats.counts[s] or 0LL
+				for _, tube_stat in pairs(stats.tube) do
+					setmetatable(tube_stat.counts, shortmap)
+					tube_stat.counts[s] = tube_stat.counts[s] or 0LL
+				end
 			end
 		end
+		setmetatable(stats.counts, shortmap)
 	return stats
 end
 
 setmetatable(M,{
-	__call = function(M, space, opts)
+	__call = function(_, space, opts)
 		M.upgrade(space,opts,1)
 	end
 })

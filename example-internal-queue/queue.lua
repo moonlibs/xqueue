@@ -1,5 +1,5 @@
 ---@class Queue
----@field q xqueueSpace space with Queue
+---@field q xqueue.space space with Queue
 ---@field opts QueueOptions options of the queue
 local M = require 'obj'.class({}, 'queue')
 
@@ -131,7 +131,7 @@ function M:_init(cfg)
 	---@type table<string, {job: any, task: Task, taken_at: number}>
 	self._task_map = {}
 
-	---@cast space xqueueSpace
+	---@cast space xqueue.space
 	self.q = space
 
 	self._on = {}

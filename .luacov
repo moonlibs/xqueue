@@ -1,0 +1,25 @@
+deletestats = false
+runreport = false
+
+exclude = {
+	"test/",
+	"%.rocks/",
+	"builtin/",
+	"example",
+}
+
+-- path renaming
+modules = {
+	['.xqueue'] = io.popen('pwd'):read('*line') .. '/xqueue.lua',
+}
+
+runreport = true
+deletestats = false
+
+coveralls = {
+	root = "/",
+	debug = true,
+	pathcorrect = {
+		{ "^/home/runner/work/xqueue/xqueue/", "" },
+	},
+}
