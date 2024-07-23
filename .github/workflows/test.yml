@@ -2,20 +2,20 @@ name: Testing with unit tests
 
 on:
   - push
-  - pull_request
 
 jobs:
   run-unit-tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ["1.10.15", "2.10.6", "2.11.0", "2.11.2"]
     steps:
     - uses: actions/checkout@v4
     - uses: tarantool/setup-tarantool@v3
       with:
-        tarantool-version: '2.10.4'
+        tarantool-version: '${{matrix.version}}'
     - name: install luacov-console
       run: tarantoolctl rocks install luacov-console
-    - name: install luacov-coveralls
-      run: tarantoolctl rocks install --server=http://luarocks.org luacov-coveralls
     - name: install luatest
       run: tarantoolctl rocks install luatest
     - name: run tests
@@ -25,6 +25,35 @@ jobs:
         .rocks/bin/luatest --coverage -b -c -v test/
     - name: print luacov-console report
       run: .rocks/bin/luacov-console "$(pwd)" && .rocks/bin/luacov-console -s
+    - name: rename luacov.stats.out
+      run: mv luacov.stats.out luacov.stats.out-${{matrix.version}}
+    - uses: actions/upload-artifact@master
+      with:
+        name: luacov.stats.out-${{matrix.version}}
+        path: luacov.stats.out-${{matrix.version}}
+  run-coverage-report:
+    runs-on: ubuntu-latest
+    needs: ["run-unit-tests"]
+    steps:
+    - uses: actions/checkout@master
+    - uses: tarantool/setup-tarantool@v3
+      with:
+        tarantool-version: '2.10.7'
+    - name: install luacov-coveralls 0.2.3
+      run: tarantoolctl rocks install --server=https://luarocks.org luacov-coveralls 0.2.3
+    - name: install luacov-console 1.2.0
+      run: tarantoolctl rocks --server http://moonlibs.github.io/rocks install luacov-console 1.2.0
+    - name: Download run artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: luacov.stats.out-*
+        merge-multiple: true
+    - name: debug
+      run: ls -la .
+    - name: merge luacov.stats.out
+      run: cat luacov.stats.out-* | >luacov.stats.out tarantool -e 'm={} for k in io.lines() do local vs=io.read():split(" ") vs[#vs]=nil local r = m[k] if r then for i, v in pairs(vs) do r[i]=r[i]+v end else m[k]=vs end end; for k, v in pairs(m) do print(k) print(table.concat(v, " ")) end'
+    - name: prepare coverage report
+      run: .rocks/bin/luacov-console . && .rocks/bin/luacov-console -s
     - name: publish coveralls report
       env:
         COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}

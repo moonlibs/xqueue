@@ -2,7 +2,6 @@ name: Linting with luacheck
 
 on:
   - push
-  - pull_request
 
 jobs:
   run-luacheck-linter:

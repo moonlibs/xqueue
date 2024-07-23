@@ -8,6 +8,11 @@ exclude = {
 	"example",
 }
 
+-- path renaming
+modules = {
+	['.xqueue'] = io.popen('pwd'):read('*line') .. '/xqueue.lua',
+}
+
 runreport = true
 deletestats = false
 

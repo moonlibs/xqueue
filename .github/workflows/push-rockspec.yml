@@ -1,0 +1,52 @@
+name: Create and push rockspec for moonlibs/xqueue
+
+on:
+  push:
+    tags:
+      - '*'
+
+env:
+  ROCK_NAME: xqueue
+
+jobs:
+  pack-and-push-tagged-rockspec:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags')
+    steps:
+    - uses: actions/checkout@master
+    - uses: tarantool/setup-tarantool@v3
+      with:
+        tarantool-version: '2.6'
+
+    # https://stackoverflow.com/questions/58177786/get-the-current-pushed-tag-in-github-actions
+    - name: Set env
+      run: echo "TAG=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+    - run: tarantoolctl rocks new_version --tag=${{ env.TAG }} rockspecs/xqueue-scm-5.rockspec ${{ env.TAG }} "git+https://github.com/${{ github.repository }}.git"
+    - run: tarantoolctl rocks --server https://moonlibs.github.io/rocks install ${{ env.ROCK_NAME }}-${{ env.TAG }}-1.rockspec
+    - run: tarantoolctl rocks pack ${{ env.ROCK_NAME }}-${{ env.TAG }}-1.rockspec
+    # Install native lua with luarocks
+    - uses: leafo/gh-actions-lua@v9
+      with:
+        luaVersion: "luajit-2.1.0-beta3"
+    - uses: leafo/gh-actions-luarocks@v4
+      with:
+        luarocksVersion: "3.8.0"
+    - uses: unfor19/install-aws-cli-action@v1.0.3
+    - run: mkdir .build && cp ${{env.ROCK_NAME}}-dev-1.rockspec ${{env.ROCK_NAME}}-${{env.TAG}}-1.rockspec .build/ && cp *.src.rock .build/
+    - name: rebuild and publish s3 luarocks server
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.MOONLIBS_S3_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.MOONLIBS_S3_SECRET_KEY}}
+        AWS_EC2_METADATA_DISABLED: true
+      run: |
+        cd .build && aws s3 sync s3://moonlibs/ ./ && luarocks-admin make_manifest . && aws s3 sync --acl public-read ./ s3://moonlibs/;
+    - uses: "marvinpinto/action-automatic-releases@latest"
+      with:
+        repo_token: "${{ secrets.GITHUB_TOKEN }}"
+        prerelease: false
+        files: |
+          README.md
+          ${{env.ROCK_NAME}}-dev-1.rockspec
+          ${{env.ROCK_NAME}}-${{env.TAG}}-1.rockspec
+          ${{env.ROCK_NAME}}-${{env.TAG}}-1.src.rock

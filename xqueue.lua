@@ -270,6 +270,7 @@ local methods = {}
 ---@field _default_truncate fun(space: boxSpaceObject)
 ---@field _on_repl replaceTrigger
 ---@field _on_dis fun()
+---@field ready? fiber.channel channel appears when xq is not ready
 
 
 ---@class xqueue.space: boxSpaceObject
@@ -581,7 +582,6 @@ function M.upgrade(space,opts,depth)
 			transition = {};
 			tube = stat_tube;
 		}
-		-- TODO: benchmark index:count()
 		if self.fields.tube then
 			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
 				local s = t[self.fields.status]
@@ -598,6 +598,8 @@ function M.upgrade(space,opts,depth)
 				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
 			end
 		end
+	else
+		self._stat = { counts = {}, transition = {}, tube = stat_tube }
 	end
 
 	-- 3. features check
@@ -819,7 +821,7 @@ function M.upgrade(space,opts,depth)
 				log.verbose("awaiting rw")
 				repeat
 					if box.ctl.wait_rw then
-						box.ctl.wait_rw(1)
+						pcall(box.ctl.wait_rw, 1)
 					else
 						fiber.sleep(0.001)
 					end
@@ -828,7 +830,8 @@ function M.upgrade(space,opts,depth)
 
 			local ok, err = pcall(func, ...)
 			if not ok then
-				log.error("%s", err)
+				log.error("%s%s",
+					err, xq.ready and ': (xq is not ready yet)' or '')
 			end
 			fiber.testcancel()
 		until (not box.space[space.name]) or space.xq ~= xq
@@ -846,11 +849,8 @@ function M.upgrade(space,opts,depth)
 				repeat fiber.sleep(0.001) until space.xq
 				if xq.ready then xq.ready:get() end
 				log.info("I am worker %s",i)
-				if box.info.ro then
-					log.info("Shutting down on ro instance")
-					return
-				end
-				while box.space[space.name] and space.xq == xq do
+				while box.space[space.name] and space.xq == xq and not box.info.ro do
+					if xq.ready then xq.ready:get() end
 					local task = space:take(1)
 					if task then
 						local key = xq:getkey(task)
@@ -869,6 +869,10 @@ function M.upgrade(space,opts,depth)
 					end
 					fiber.yield()
 				end
+				if box.info.ro then
+					log.info("Shutting down on ro instance")
+					return
+				end
 				log.info("worker %s ended", i)
 			end,space,self)
 		end
@@ -884,14 +888,10 @@ function M.upgrade(space,opts,depth)
 			if xq.ready then xq.ready:get() end
 			local chan = xq.runat_chan
 			log.info("Runat started")
-			if box.info.ro then
-				log.info("Shutting down on ro instance")
-				return
-			end
 			local maxrun = 1000
 			local curwait
 			local collect = {}
-			while box.space[space.name] and space.xq == xq do
+			while box.space[space.name] and space.xq == xq and not box.info.ro do
 				local r,e = pcall(function()
 					-- print("runat loop 2 ",box.time64())
 					local remaining
@@ -967,6 +967,10 @@ function M.upgrade(space,opts,depth)
 				-- log.info("Wait %0.2fs",curwait)
 				if curwait == 0 then fiber.sleep(0) end
 				chan:get(curwait)
+			end
+			if box.info.ro then
+				log.info("Shutting down on ro instance")
+				return
 			end
 			log.info("Runat ended")
 		end,space,self,runat_index)
@@ -1164,7 +1168,6 @@ function M.upgrade(space,opts,depth)
 
 	log.info("Upgraded %s into xqueue (status=%s)", space.name, box.info.status)
 
-
 	function self:starttest()
 		local xq = self
 		if box.info.status == 'orphan' then
@@ -1181,10 +1184,16 @@ function M.upgrade(space,opts,depth)
 		if box.info.ro then
 			log.info("Server is ro, not resetting statuses")
 		else
-			-- FIXME: with stable iterators add yield
 			local space = box.space[self.space]
+			local ver = tonumber(rawget(_G, '_TARANTOOL'):match('^([^.]+%.[^.]+)'))
+			local yield_limit = 2^32-1
+			local scanned = 0
+			if ver >= 1.10 then
+				yield_limit = 1000
+			end
 			box.begin()
 			for _,t in self.index:pairs({'T'},{ iterator = box.index.EQ }) do
+				scanned = scanned + 1
 				local key = t[ xq.key.no ]
 				if not self.taken[key] and not self._lock[key] then
 					local update = {
@@ -1196,6 +1205,11 @@ function M.upgrade(space,opts,depth)
 					}
 					space:update({key}, update)
 					log.info("Start: T->R (%s)", key)
+				end
+				if scanned == yield_limit then
+					scanned = 0
+					box.commit()
+					box.begin()
 				end
 			end
 			box.commit()
@@ -1713,16 +1727,19 @@ end
 
 -- special remap of truncate for deliting stats and saving methods
 function methods:truncate()
-	local stat = self.xq._stat
+	local xq = self.xq
+	xq.ready = xq.ready or fiber.channel(0)
+	local stat = xq._stat
 	for status, _ in pairs(stat.counts) do
 		stat.counts[status] = 0LL
 	end
 	for transition, _ in pairs(stat.transition) do
 		stat.transition[transition] = nil
 	end
-	local ret = self.xq._default_truncate(self)
+	local ret = xq._default_truncate(self)
 	local meta = debug.getmetatable(self)
 	for k,v in pairs(methods) do meta[k] = v end
+	xq:make_ready()
 	-- Now we reset our methods after truncation because
 	-- as we can see in on_replace_dd_truncate:
 	-- https://github.com/tarantool/tarantool/blob/0b7cc52607b2290d2f35cc68ee1a8243988c2735/src/box/alter.cc#L2239
@@ -1740,6 +1757,8 @@ local pretty_st = {
 	D = "Done",
 }
 
+local shortmap = { __serialize = 'map' }
+
 ---@param pretty? boolean
 function methods:stats(pretty)
 	local stats = table.deepcopy(self.xq._stat)
@@ -1754,10 +1773,12 @@ function methods:stats(pretty)
 			else
 				stats.counts[s] = stats.counts[s] or 0LL
 				for _, tube_stat in pairs(stats.tube) do
+					setmetatable(tube_stat.counts, shortmap)
 					tube_stat.counts[s] = tube_stat.counts[s] or 0LL
 				end
 			end
 		end
+		setmetatable(stats.counts, shortmap)
 	return stats
 end
 

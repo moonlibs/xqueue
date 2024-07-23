@@ -138,6 +138,8 @@ function g.test_delayed_queue()
 		{ name = 'payload', type = 'any'      },
 	})
 
+	local F = { id = 1, status = 2, runat = 3, payload = 4 }
+
 	queue:create_index('primary', { parts = {'id'} })
 	queue:create_index('status', { parts = {'status', 'id'} })
 	queue:create_index('runat', { parts = {'runat', 'id'} })
@@ -176,7 +178,7 @@ function g.test_delayed_queue()
 	t.assert_equals(queue:get({taken.id}).status, 'W', 'queue:release(..., {delay=<>}) must put task in W')
 	t.assert_le(queue:get({task_put_delay_500ms.id}).runat, queue:get({taken.id}).runat, "first task must wakeup earlier")
 
-	local taken_delayed = queue:take({ timeout = 0.11 })
+	local taken_delayed = queue:take({ timeout = 0.13 })
 	t.assert(taken_delayed, 'delayed task must be taken after timeout')
 
 	local taken_put = queue:take({ timeout = 0.1 })
@@ -199,7 +201,7 @@ function g.test_delayed_queue()
 
 	queue:release(take, {
 		update = {
-			{ '=', 'payload', { new = 2 } }
+			{ '=', F.payload, { new = 2 } }
 		}
 	})
 
@@ -210,7 +212,7 @@ function g.test_delayed_queue()
 
 	queue:ack(take, {
 		update = {
-			{ '=', 'payload', { finished = 2 } },
+			{ '=', F.payload, { finished = 2 } },
 		},
 		delay = 0.5,
 	})

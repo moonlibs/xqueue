@@ -28,6 +28,7 @@ function g.test_untake()
 		{ name = 'runat',   type = 'number'   },
 		{ name = 'payload', type = 'any'      },
 	})
+	local F = { id = 1, status = 2, runat = 3, payload = 4 }
 
 	queue:create_index('primary', { parts = {'id'} })
 	queue:create_index('status', { parts = {'status', 'id'} })
@@ -37,6 +38,7 @@ function g.test_untake()
 		features = {
 			id = 'time64',
 			delayed = true,
+			retval = 'table',
 		},
 		fields = {
 			status = 'status',
@@ -76,11 +78,11 @@ function g.test_untake()
 	t.assert_equals(task.id, taken.id, "retutned the same task (2nd)")
 
 	local processed_at = clock.time()
-	local acked = tt:call('box.space.queue:ack', {taken, { update = {{'=', 'payload', { processed_at = processed_at }}} }})
-	t.assert_equals(acked.id, taken.id, ":ack() returned taken but completed task")
+	local acked = tt:call('box.space.queue:ack', {taken, { update = {{'=', F.payload, { processed_at = processed_at }}} }}, {timeout = 1})
+	t.assert_equals(acked[1], taken.id, ":ack() returned taken but completed task")
 
 	local awaiter_res = awaiter_fin:get()
-	t.assert_equals(awaiter_res[1].id, acked.id, "awaiter saw acknowledged task")
+	t.assert_equals(awaiter_res[1].id, acked[1], "awaiter saw acknowledged task")
 	t.assert_equals(awaiter_res[2], true, "awaiter saw task as processed")
 
 	tt:close()
