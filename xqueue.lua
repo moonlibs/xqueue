@@ -33,14 +33,14 @@ rawset(_G,"\0xq.on_connect",box.session.on_connect(function()
 	local peer = box.session.peer()
 	box.session.storage.peer = box.session.peer()
 	peers[ sid ] = peer
-	log.info("connected %s, sid=%s, fid=%s", peer, sid, fiber.id() )
+	log.debug("connected %s, sid=%s, fid=%s", peer, sid, fiber.id() )
 end,rawget(_G,"\0xq.on_connect")))
 
 rawset(_G,"\0xq.on_disconnect",box.session.on_disconnect(function()
 	local sid = box.session.id()
 	local peer = peers[ sid ]
 	peers[ sid ] = nil
-	log.info("disconnected %s, sid=%s, fid=%s", peer, sid, fiber.id() )
+	log.debug("disconnected %s, sid=%s, fid=%s", peer, sid, fiber.id() )
 end,rawget(_G,"\0xq.on_disconnect")))
 
 
