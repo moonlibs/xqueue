@@ -1,0 +1,27 @@
+name: Benchmarking code
+
+on:
+  - push
+
+jobs:
+  run-unit-benchmarks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ["2.10.6", "2.11.0", "2.11.2"]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: tarantool/setup-tarantool@v3
+      with:
+        tarantool-version: '${{matrix.version}}'
+    - name: install argparse
+      run: tarantoolctl rocks install argparse
+    - name: install luabench
+      run: tarantoolctl rocks --server=https://moonlibs.org install luabench 0.3.0
+    - name: run benchmarks
+      env:
+        LUABENCH_USE_BMF: false
+        LUABENCH_TIMEOUT: 60
+        LUABENCH_DURATION: '10s'
+      run: |
+        .rocks/bin/luabench
