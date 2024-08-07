@@ -40,7 +40,7 @@ xqueue.upgrade(box.space.queue, {
 
 local queue = box.space.queue --[[@as xqueue.space]]
 lb.before_all(function() queue:truncate() end)
-lb.after_all(function() queue:truncate() box.snapshot() end)
+lb.after_all(function() box.space.queue:truncate() box.snapshot() end)
 
 local M = {}
 
