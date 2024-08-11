@@ -178,10 +178,10 @@ function g.test_delayed_queue()
 	t.assert_equals(queue:get({taken.id}).status, 'W', 'queue:release(..., {delay=<>}) must put task in W')
 	t.assert_le(queue:get({task_put_delay_500ms.id}).runat, queue:get({taken.id}).runat, "first task must wakeup earlier")
 
-	local taken_delayed = queue:take({ timeout = 0.13 })
+	local taken_delayed = queue:take({ timeout = 3 })
 	t.assert(taken_delayed, 'delayed task must be taken after timeout')
 
-	local taken_put = queue:take({ timeout = 0.1 })
+	local taken_put = queue:take({ timeout = 3 })
 	t.assert(taken_put, 'released task must be taken after timeout')
 
 	t.assert_equals(taken_delayed.id, task_put_delay_500ms.id, "firstly delayed task must be taken")

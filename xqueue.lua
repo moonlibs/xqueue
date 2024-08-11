@@ -215,6 +215,15 @@ local function _table2tuple ( qformat )
 	return dostring(fun)
 end
 
+local pretty_st = {
+	R = "Ready",
+	T = "Taken",
+	W = "Waiting",
+	B = "Buried",
+	Z = "Zombie",
+	D = "Done",
+}
+
 ---@class xqueue.space
 local methods = {}
 
@@ -583,19 +592,17 @@ function M.upgrade(space,opts,depth)
 			tube = stat_tube;
 		}
 		if self.fields.tube then
-			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
-				local s = t[self.fields.status]
-				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
-
-				local tube = t[self.fields.tube]
-				if stat_tube[tube] then
-					stat_tube[tube].counts[s] = (stat_tube[tube].counts[s] or 0LL) + 1
+			for status in pairs(pretty_st) do
+				self._stat.counts[status] = 0LL+self.index:count(status)
+			end
+			for tube in pairs(stat_tube) do
+				for status in pairs(pretty_st) do
+					stat_tube[tube].counts[status] = 0LL+self.tube_index:count({ tube, status })
 				end
 			end
 		else
-			for _, t in space:pairs(nil, { iterator = box.index.ALL }) do
-				local s = t[self.fields.status]
-				self._stat.counts[s] = (self._stat.counts[s] or 0LL) + 1
+			for status in pairs(pretty_st) do
+				self._stat.counts[status] = 0LL+self.index:count(status)
 			end
 		end
 	else
@@ -1747,15 +1754,6 @@ function methods:truncate()
 	-- but without methods
 	return ret
 end
-
-local pretty_st = {
-	R = "Ready",
-	T = "Taken",
-	W = "Waiting",
-	B = "Buried",
-	Z = "Zombie",
-	D = "Done",
-}
 
 local shortmap = { __serialize = 'map' }
 
