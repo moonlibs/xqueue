@@ -308,7 +308,7 @@ local methods = {}
 ---Requires runat field and index.
 ---@field ttr? boolean|number should xqueue allow Time-To-Release on tasks. When specified with number, this value used for ttl_default.
 ---Requires runat field and index.
----@field not_check_session? boolean should xqueue check session. Requires enabled ttr feature.
+---@field not_check_session? boolean should xqueue not check session. Requires enabled ttr feature.
 
 ---@class xqueue.upgrade.options
 ---@field format? boxSpaceFormat
