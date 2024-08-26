@@ -960,8 +960,12 @@ function M.upgrade(space,opts,depth)
 								{ '=',xq.fields.runat, xq.NEVER }
 							})
 							xq.taken[ key ] = nil
-							if sid then
+							if self.bysid[ sid ] then
 								self.bysid[ sid ][ key ] = nil
+							elseif self.features.not_check_session then
+								log.info("Runat: task {%s} marked as taken by sid=%s but bysid already is null after disconnect", key, sid)
+							else
+								log.error("Runat: task {%s} marked as taken by sid=%s but bysid is null", key, sid)
 							end
 							xq:wakeup(u)
 						else
@@ -1021,7 +1025,7 @@ function M.upgrade(space,opts,depth)
 			error(string.format( "Task %s not taken by any", key ),2)
 		end
 		-- if not need to check session that return task
-		if xq.not_check_session then
+		if self.features.not_check_session then
 			return t
 		end
 		if self.taken[key] ~= box.session.id() then
@@ -1037,8 +1041,10 @@ function M.upgrade(space,opts,depth)
 			self.taken[ key ] = nil
 			if self.bysid[ sid ] then
 				self.bysid[ sid ][ key ] = nil
+			elseif self.features.not_check_session then
+				log.info("Task {%s} marked as taken by sid=%s but bysid already is null after disconnect", key, sid)
 			else
-				log.error( "Task {%s} marked as taken by sid=%s but bysid is null", key, sid)
+				log.error("Task {%s} marked as taken by sid=%s but bysid is null", key, sid)
 			end
 		else
 			log.error( "Task {%s} not marked as taken, untake by sid=%s", key, box.session.id() )
@@ -1172,7 +1178,7 @@ function M.upgrade(space,opts,depth)
 				for key,realkey in pairs(old) do
 					-- if xq with check session we release task on disconnect
 					-- so need clear from taken
-					if not xq.features.not_check_session then
+					if not self.features.not_check_session then
 						self.taken[key] = nil
 					end
 					old[key] = nil
@@ -1181,8 +1187,8 @@ function M.upgrade(space,opts,depth)
 						if t[ self.fields.status ] == 'T' then
 							-- if not check session we doesn't release task
 							-- it can be ack/bury/release from another connection
-							if xq.features.not_check_session then
-								log.info("Rst: task %s taken by another session %s", realkey, sid)
+							if self.features.not_check_session then
+								log.info("Rst: task %s taken by session %s not released", realkey, sid)
 							else
 								self:wakeup(space:update({ realkey }, {
 									{ '=',self.fields.status,'R' },
