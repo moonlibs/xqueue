@@ -896,7 +896,7 @@ function M.upgrade(space,opts,depth)
 								space:ack(task)
 							end
 						end
-						if xq.taken[ key ] and not self.features.not_check_session then
+						if xq.taken[ key ] then
 							log.error("Worker for {%s} not released task", key)
 							space:release(task)
 						end
