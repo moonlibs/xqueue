@@ -758,6 +758,16 @@ function M.upgrade(space,opts,depth)
 		end
 
 		features.not_check_session = true
+
+		setmetatable(self.bysid, {
+			__serialize = 'map',
+			__newindex = function(_, _, _) end,
+			__index = function(_, _) return {} end,
+		})
+		setmetatable(self.taken, {
+			__serialize = 'map',
+			__newindex = function(_, _, _) end,
+		})
 	else
 		features.not_check_session = false
 	end
@@ -882,11 +892,11 @@ function M.upgrade(space,opts,depth)
 						if not r then
 							log.error("Worker for {%s} has error: %s", key, e)
 						else
-							if xq.taken[ key ] then
+							if xq.taken[ key ] or self.features.not_check_session then
 								space:ack(task)
 							end
 						end
-						if xq.taken[ key ] then
+						if xq.taken[ key ] and not self.features.not_check_session then
 							log.error("Worker for {%s} not released task", key)
 							space:release(task)
 						end
@@ -960,12 +970,8 @@ function M.upgrade(space,opts,depth)
 								{ '=',xq.fields.runat, xq.NEVER }
 							})
 							xq.taken[ key ] = nil
-							if self.bysid[ sid ] then
+							if sid then
 								self.bysid[ sid ][ key ] = nil
-							elseif self.features.not_check_session then
-								log.info("Runat: task {%s} marked as taken by sid=%s but bysid already is null after disconnect", key, sid)
-							else
-								log.error("Runat: task {%s} marked as taken by sid=%s but bysid is null", key, sid)
 							end
 							xq:wakeup(u)
 						else
@@ -1021,12 +1027,12 @@ function M.upgrade(space,opts,depth)
 		if not t then
 			error(string.format( "Task {%s} was not found", key ),2)
 		end
-		if not self.taken[key] then
-			error(string.format( "Task %s not taken by any", key ),2)
-		end
 		-- if not need to check session that return task
 		if self.features.not_check_session then
 			return t
+		end
+		if not self.taken[key] then
+			error(string.format( "Task %s not taken by any", key ),2)
 		end
 		if self.taken[key] ~= box.session.id() then
 			error(string.format( "Task %s taken by %d. Not you (%d)", key, self.taken[key], box.session.id() ),2)
@@ -1041,12 +1047,10 @@ function M.upgrade(space,opts,depth)
 			self.taken[ key ] = nil
 			if self.bysid[ sid ] then
 				self.bysid[ sid ][ key ] = nil
-			elseif self.features.not_check_session then
-				log.info("Task {%s} marked as taken by sid=%s but bysid already is null after disconnect", key, sid)
 			else
 				log.error("Task {%s} marked as taken by sid=%s but bysid is null", key, sid)
 			end
-		else
+		elseif not self.features.not_check_session then
 			log.error( "Task {%s} not marked as taken, untake by sid=%s", key, box.session.id() )
 		end
 
@@ -1176,11 +1180,7 @@ function M.upgrade(space,opts,depth)
 			local old = self.bysid[sid]
 			while next(old) do
 				for key,realkey in pairs(old) do
-					-- if xq with check session we release task on disconnect
-					-- so need clear from taken
-					if not self.features.not_check_session then
-						self.taken[key] = nil
-					end
+					self.taken[key] = nil
 					old[key] = nil
 					local t = space:get(realkey)
 					if t then

@@ -80,6 +80,9 @@ M.upgrade(space, {
         ttr    = true|number,    -- requires `runat` field
         -- Time To Release. Task is returned into [R]eady unless processed (turned to ack|release from taken) within time
         -- if number, then with default ttl, otherwise only if set during take
+
+        not_check_session = true, -- requires 'ttr'
+        -- if true, not check session on ack/bury/release and not release task on disconnect
     },
     -- Set tubes for which statistics collector will be enabled
     tube_stats = { 'tube-1', 'tube-2' },
