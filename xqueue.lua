@@ -1143,7 +1143,7 @@ function M.upgrade(space,opts,depth)
 		local sid = box.session.id()
 		local peer = box.session.storage.peer
 
-		log.info("%s: disconnected %s, sid=%s, fid=%s", space.name, peer, sid, fiber.id() )
+		log.debug("%s: disconnected %s, sid=%s, fid=%s", space.name, peer, sid, fiber.id() )
 		box.session.storage.destroyed = true
 		if self.bysid[sid] then
 			local old = self.bysid[sid]
