@@ -5,12 +5,12 @@ on:
 
 jobs:
   run-luacheck-linter:
-   runs-on: ubuntu-latest
+   runs-on: ubuntu-22.04
    steps:
     - uses: actions/checkout@v4
     - uses: tarantool/setup-tarantool@v3
       with:
-        tarantool-version: '2.10.4'
+        tarantool-version: '2.10'
 
     - name: install tarantool/luacheck and execute it
       run: tarantoolctl rocks install luacheck && .rocks/bin/luacheck .
