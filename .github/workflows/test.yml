@@ -32,13 +32,13 @@ jobs:
         name: luacov.stats.out-${{matrix.version}}
         path: luacov.stats.out-${{matrix.version}}
   run-coverage-report:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: ["run-unit-tests"]
     steps:
     - uses: actions/checkout@master
     - uses: tarantool/setup-tarantool@v3
       with:
-        tarantool-version: '2.10.7'
+        tarantool-version: '2.10'
     - name: install luacov-coveralls 0.2.3
       run: tarantoolctl rocks install --server=https://luarocks.org luacov-coveralls 0.2.3
     - name: install luacov-console 1.2.0
