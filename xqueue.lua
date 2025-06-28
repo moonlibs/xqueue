@@ -1709,8 +1709,15 @@ function methods:touch(key, attr)
 		increment = attr.increment
 	end
 
-	local t = xq:check_owner(key)
+	local t = self:get(key)
+	if not t then
+		error(string.format( "Task {%s} was not found", key ),2)
+	end
+
 	local status = t[ xq.fields.status ]
+	if status == 'T' then
+		xq:check_owner(key)	
+	end
 
 	-- delayed or ttl or default ttl
 	if xq.have_runat and (status == 'T') or (status == 'R') then
