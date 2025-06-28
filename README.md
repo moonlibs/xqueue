@@ -154,6 +154,13 @@ box.space.myqueue:put({ name="xxx"; data="yyy"; }, { delay = 1.5; ttl = 100 })
   * `timeout` - number of seconds to wait for the task processing
   * returns task tuple or table (see retval) and boolean `was_processed` flag
 
+* `space:touch(id, [attr])`
+	- `id`:
+		+ `string` | `number` - primary key
+		+ `tuple` - key will be extracted using index
+	- `attr`
+		+ `increment` - the value of ttr and ttl (.runat) increased by increment seconds
+
 ### Admin methods
 
 * `space:dig(id, [attr])` - dig out task from buried state
