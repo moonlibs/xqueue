@@ -1716,6 +1716,63 @@ function methods:bury(key, attr)
 	xq:putback(t)
 end
 
+--[[
+* `space:touch(id, [attr])`
+	- `id`:
+		+ `string` | `number` - primary key
+		+ `tuple` - key will be extracted using index
+	- `attr`
+		+ `increment` - the value of ttr and ttl (.runat) increased by increment seconds
+]]
+
+---@param key table|scalar|box.tuple
+---@param attr? { increment: number? }
+---@return table|box.tuple
+function methods:touch(key, attr)
+	local xq = self.xq
+	key = xq:getkey(key)
+
+	attr = attr or {}
+
+	local increment = 0
+	if type(attr.increment) ~= 'number' then
+		error("attr.increment must be number", 2)
+	end
+	if attr.increment < 0 then
+		error("attr.increment can't be negative", 2)
+	end
+
+	if attr.increment then
+		increment = attr.increment
+	end
+
+	local t = self:get(key)
+	if not t then
+		error(string.format( "Task {%s} was not found", key ),2)
+	end
+
+	local status = t[ xq.fields.status ]
+	if status == 'T' then
+		xq:check_owner(key)	
+	end
+
+	-- delayed or ttl or default ttl
+	if xq.have_runat and (status == 'T') or (status == 'R') then
+		xq:atomic(key,function()
+			t = self:update({key}, {{ '+', xq.fields.runat,  increment}})
+
+			---@cast t box.tuple
+			xq:wakeup(t)
+			if xq.have_runat then
+				xq.runat_chan:put(true,0)
+			end
+			log.info("Touch: {%s} run_at +%s seconds from %s/sid=%s/fid=%s", key, attr.increment, box.session.storage.peer, box.session.id(), fiber.id())
+		end)
+	end
+
+	return t
+end
+
 local function kick_task(self, key, attr)
 	local xq   = self.xq
 	key  = xq:getkey(key)
