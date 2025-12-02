@@ -851,12 +851,25 @@ function M.upgrade(space,opts,depth)
 			fiber.create(rw_fiber_f, function(space,xq)
 				local fname = space.name .. '.xq.wrk' .. tostring(i)
 				---@diagnostic disable-next-line: undefined-field
-				if package.reload then fname = fname .. '.' .. package.reload.count end
+				local start_gen = 0
+				if package.reload then
+					start_gen = package.reload.count
+				end
+				fname = fname .. '.' .. start_gen
+
+				local was_reload = function()
+					local curr_gen = 0
+					if package.reload then
+						curr_gen = package.reload.count
+					end
+					return curr_gen ~= start_gen
+				end
+
 				fiber.name(string.sub(fname,1,32))
 				repeat fiber.sleep(0.001) until space.xq
 				if xq.ready then xq.ready:get() end
-				log.info("I am worker %s",i)
-				while box.space[space.name] and space.xq == xq and not box.info.ro do
+				log.info("I am worker %s in gen %s",i, start_gen)
+				while box.space[space.name] and space.xq == xq and not box.info.ro and not was_reload() do
 					if xq.ready then xq.ready:get() end
 					local task = space:take(1)
 					if task then
@@ -880,6 +893,12 @@ function M.upgrade(space,opts,depth)
 					log.info("Shutting down on ro instance")
 					return
 				end
+
+				if was_reload() then
+					log.info("Shutting down after package.reload")
+					return
+				end
+
 				log.info("worker %s ended", i)
 			end,space,self)
 		end
@@ -889,7 +908,21 @@ function M.upgrade(space,opts,depth)
 		self.runat_chan = fiber.channel(0)
 		self.runat = fiber.create(rw_fiber_f, function(space,xq,runat_index)
 			local fname = space.name .. '.xq'
-			if package.reload then fname = fname .. '.' .. package.reload.count end
+			local start_gen = 0
+
+			if package.reload then
+				start_gen = package.reload.count
+			end
+			fname = fname .. '.' .. start_gen
+
+			local was_reload = function()
+				local curr_gen = 0
+				if package.reload then
+					curr_gen = package.reload.count
+				end
+				return curr_gen ~= start_gen
+			end
+
 			fiber.name(string.sub(fname,1,32))
 			repeat fiber.sleep(0.001) until space.xq
 			if xq.ready then xq.ready:get() end
@@ -898,7 +931,7 @@ function M.upgrade(space,opts,depth)
 			local maxrun = 1000
 			local curwait
 			local collect = {}
-			while box.space[space.name] and space.xq == xq and not box.info.ro do
+			while box.space[space.name] and space.xq == xq and not box.info.ro and not was_reload() do
 				local r,e = pcall(function()
 					-- print("runat loop 2 ",box.time64())
 					local remaining
@@ -979,6 +1012,12 @@ function M.upgrade(space,opts,depth)
 				log.info("Shutting down on ro instance")
 				return
 			end
+
+			if was_reload() then
+				log.info("Shutting down after package.reload")
+				return
+			end
+
 			log.info("Runat ended")
 		end,space,self,runat_index)
 	end
