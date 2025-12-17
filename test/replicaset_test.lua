@@ -189,6 +189,29 @@ function g.test_start(test)
 		retval = 'table',
 	} --[[@as xqueue.upgrade.options]]
 
+	local queue_not_check_session = {
+		name = 'queue_not_check_session',
+		format = {
+			{ name = 'id',      type = 'string' },
+			{ name = 'status',  type = 'string' },
+			{ name = 'runat',   type = 'number' },
+			{ name = 'payload', type = 'any'    },
+		},
+		features = {
+			id = 'uuid',
+			keep = false,
+			delayed = true,
+			not_check_session = true,
+			ttr = 60,
+		},
+		fields = {
+			id = 'id',
+			status = 'status',
+			runat = 'runat',
+		},
+		retval = 'table',
+	} --[[@as xqueue.upgrade.options]]
+
 	local had_error
 	local await = {}
 	for _, srv in pairs(replica_set.servers) do
@@ -196,6 +219,12 @@ function g.test_start(test)
 		local fib = fiber.create(function()
 			fiber.self():set_joinable(true)
 			local ok, err = pcall(srv.exec, srv, setup_queue, {simpleq}, { timeout = 20 })
+			if not ok then
+				had_error = err
+				log.error("%s: %s", srv.alias, err)
+			end
+
+			local ok, err = pcall(srv.exec, srv, setup_queue, {queue_not_check_session}, { timeout = 20 })
 			if not ok then
 				had_error = err
 				log.error("%s: %s", srv.alias, err)
@@ -213,6 +242,13 @@ function g.test_start(test)
 	local cookie = require'uuid'.str()
 	local task = rw:call('box.space.simpleq:put', {{payload = {cookie = cookie}}, { delay = 5 } })
 	t.assert(task, "task was returned")
+
+	local task_not_check_session = rw:call('box.space.queue_not_check_session:put', {{payload = {}} })
+	t.assert(task_not_check_session, "task was returned")
+
+	local taken = rw:call('box.space.queue_not_check_session:take', { 1 }, { timeout = 1 })
+	t.assert(taken, ":take() returned task from master")
+	t.assert_equals(task_not_check_session.id, taken.id, "returned the same task")
 
 	local SWITCH_TIMEOUT = 10
 
@@ -274,8 +310,24 @@ function g.test_start(test)
 		t.assert_equals(trw.alias, rw.alias, "after rw-switch luatest succesfully derived new leader")
 	end
 
+	local awaiter_fin = fiber.channel()
+
+	fiber.create(function()
+		local ret, is_processed
+		ret, is_processed = rw:call('box.space.queue_not_check_session:wait', { task_not_check_session, 1 }, { timeout = 1 })
+		t.assert_equals(ret.id, task_not_check_session.id, "Task has been awaited")
+		t.assert_equals(is_processed, true, "Task has been processed by the consumer")
+		t.assert(awaiter_fin:put({ ret, is_processed }), "awaiter results were measured")
+	end)
+
+	local acked = rw:call('box.space.queue_not_check_session:ack', { taken }, { timeout = 1 })
+	t.assert_equals(acked[1], taken.id, ":ack() returned taken but completed task")
+
+	local awaiter_res = awaiter_fin:get()
+	t.assert_equals(awaiter_res[1].id, acked[1], "awaiter saw acknowledged task")
+	t.assert_equals(awaiter_res[2], true, "awaiter saw task as processed")
+
 	local task = rw:call('box.space.simpleq:take', { 5 }, { timeout = 6 })
 	t.assert(task, "delayed task has been succesfully taken from new leader")
 	t.assert_equals(task.payload.cookie, cookie, "task.cookie is valid")
-
 end

@@ -124,6 +124,9 @@ Interface:
 				-- if number, then with default ttl, otherwise only if set during put/release
 			ttr    = true|number,    -- requires `runat` field
 				-- if number, then with default ttl, otherwise only if set
+
+			not_check_session = true, -- if true, not check session on ack/bury/release and not release task on disconnect
+				-- requires 'ttr'
 		},
 	})
 
@@ -245,6 +248,7 @@ local methods = {}
 ---@field ttr boolean|number
 ---@field ttl_default number?
 ---@field ttr_default number?
+---@field not_check_session boolean
 
 ---@class xq:table
 ---@field NEVER integer (Default: 0)
@@ -304,6 +308,7 @@ local methods = {}
 ---Requires runat field and index.
 ---@field ttr? boolean|number should xqueue allow Time-To-Release on tasks. When specified with number, this value used for ttl_default.
 ---Requires runat field and index.
+---@field not_check_session? boolean should xqueue not check session. Requires enabled ttr feature.
 
 ---@class xqueue.upgrade.options
 ---@field format? boxSpaceFormat
@@ -745,6 +750,28 @@ function M.upgrade(space,opts,depth)
 		features.ttr = false
 	end
 
+	if opts.features.not_check_session then
+		-- feature not_check_session require ttr because in this case
+		-- task isn't released on disconnect so to prevent the task from being frozen in the queue we need ttr
+		if not features.ttr then
+			error(string.format("feature not_check_session requires enabled ttr" ),2+depth)
+		end
+
+		features.not_check_session = true
+
+		setmetatable(self.bysid, {
+			__serialize = 'map',
+			__newindex = function(_, _, _) end,
+			__index = function(_, _) return {} end,
+		})
+		setmetatable(self.taken, {
+			__serialize = 'map',
+			__newindex = function(_, _, _) end,
+		})
+	else
+		features.not_check_session = false
+	end
+
 	if fields.tube then
 		features.tube = true
 	end
@@ -889,7 +916,7 @@ function M.upgrade(space,opts,depth)
 						if not r then
 							log.error("Worker for {%s} has error: %s", key, e)
 						else
-							if xq.taken[ key ] then
+							if xq.taken[ key ] or self.features.not_check_session then
 								space:ack(task)
 							end
 						end
@@ -1037,6 +1064,10 @@ function M.upgrade(space,opts,depth)
 		if not t then
 			error(string.format( "Task {%s} was not found", key ),2)
 		end
+		-- if not need to check session that return task
+		if self.features.not_check_session then
+			return t
+		end
 		if not self.taken[key] then
 			error(string.format( "Task %s not taken by any", key ),2)
 		end
@@ -1054,9 +1085,9 @@ function M.upgrade(space,opts,depth)
 			if self.bysid[ sid ] then
 				self.bysid[ sid ][ key ] = nil
 			else
-				log.error( "Task {%s} marked as taken by sid=%s but bysid is null", key, sid)
+				log.error("Task {%s} marked as taken by sid=%s but bysid is null", key, sid)
 			end
-		else
+		elseif not self.features.not_check_session then
 			log.error( "Task {%s} not marked as taken, untake by sid=%s", key, box.session.id() )
 		end
 
@@ -1191,11 +1222,17 @@ function M.upgrade(space,opts,depth)
 					local t = space:get(realkey)
 					if t then
 						if t[ self.fields.status ] == 'T' then
-							self:wakeup(space:update({ realkey }, {
-								{ '=',self.fields.status,'R' },
-								self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
-							}))
-							log.info("Rst: T->R {%s}", realkey )
+							-- if not check session we doesn't release task
+							-- it can be ack/bury/release from another connection
+							if self.features.not_check_session then
+								log.info("Rst: task %s taken by session %s not released", realkey, sid)
+							else
+								self:wakeup(space:update({ realkey }, {
+									{ '=',self.fields.status,'R' },
+									self.have_runat and { '=', self.fields.runat, self.NEVER } or nil
+								}))
+								log.info("Rst: T->R {%s}", realkey )
+							end
 						else
 							log.error( "Rst: %s->? {%s}: wrong status", t[self.fields.status], realkey )
 						end
