@@ -1504,7 +1504,7 @@ function methods:take(timeout, opts)
 			local left = (now + timeout) - fiber.time()
 			if left <= 0 then goto finish end
 
-			(tube_chan or xq.take_wait):get(left)
+			(tube_chan and not tube_chan:is_closed() or xq.take_wait):get(left)
 			if box.session.storage.destroyed then goto finish end
 		end
 	end
